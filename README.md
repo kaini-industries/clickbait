@@ -1,36 +1,78 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Clickbait
+
+Sight-in & turret assistant for MOA-based rifle and pistol optics. Tap your shots on an interactive splatter target, and Clickbait tells you exactly how many clicks to dial — and in which direction — to zero your optic.
+
+Built as a mobile-first PWA-style web app designed to be used at the range.
+
+## Features
+
+### Zero Tab
+- **Interactive splatter target** — tap where your shots landed on a Shoot-N-C-style target, or type offsets manually
+- **Instant click calculations** — converts point-of-impact offset to turret clicks using the selected optic's MOA-per-click value
+- **Residual error display** — shows how much offset remains after rounding to the nearest whole click
+- **Predicted POI** — visualizes where your next group should land after dialing the recommended adjustment
+- **Group size measurement** — calculates extreme spread (max distance between any two shots)
+- **Travel limit warning** — alerts you if the needed adjustment exceeds half the turret's total range
+- **Turret rotation guidance** — tells you which direction to turn the screw (clockwise/counter-clockwise) for scopes with known rotation conventions
+- **Imperial and metric units** — yards/inches or meters/centimeters with appropriate distance and target span presets
+
+### Center Turrets Tab
+- **Guided centering procedure** — step-by-step walkthrough to find the mechanical center of each turret
+- **Click counter** — large tap-friendly +1/+10/-1 buttons for counting clicks from stop to stop
+- **Automatic halfway calculation** — divides your total count by 2 and tells you how far to come back
+
+### Adjustment Log
+- **Timestamped history** — every adjustment you stamp is logged with optic name, distance, elevation/windage clicks, and group size
+- **Persistent across sessions** — all data stored in localStorage
+
+### Optic Profiles
+- **Built-in presets** — Holosun HS507C-X2 (1 MOA/click) and Primary Arms SLx 3x32 Gen III (0.25 MOA/click)
+- **Custom optics** — add your own with configurable MOA-per-click and total travel range
+- **Non-destructive editing** — editing a built-in preset automatically clones it so defaults can always be restored
+
+## The Math
+
+The core calculation converts a linear offset (inches or centimeters) to turret clicks:
+
+```
+perClick = clickMOA × perMOA(distance)
+clicks   = round(offset / perClick)
+```
+
+Where `perMOA(distance)` returns the linear size of 1 MOA at the shooting distance:
+- **Imperial:** 1.047 × distance_yd / 100 (inches)
+- **Metric:** 2.908 × distance_m / 100 (centimeters)
+
+Direction follows the standard "chase the bullet hole" rule — if the shot is low, dial up; if the shot is left, dial right.
+
+## Tech Stack
+
+- [Next.js](https://nextjs.org) 16 (App Router)
+- [React](https://react.dev) 19
+- No external UI libraries — all styles are inline
+- Google Fonts: Saira Condensed (headings) and IBM Plex Mono (data)
+- localStorage for persistence (no backend)
 
 ## Getting Started
 
-First, run the development server:
-
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000) in your browser.
 
-You can start editing the page by modifying `app/page.js`. The page auto-updates as you edit the file.
+## Build for Production
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+npm run build
+npm start
+```
 
-## Learn More
+## Deploy
 
-To learn more about Next.js, take a look at the following resources:
+Deploys to any platform that supports Next.js — Vercel, Netlify, Docker, or a static export via `next build`.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## License
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Private — not currently licensed for redistribution.
