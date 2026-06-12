@@ -384,7 +384,7 @@ function AppInner() {
   const [span, setSpan] = useState(12);
   const [shots, setShots] = useState([]);
   const [ghosts, setGhosts] = useState([]);
-  const [mode, setMode] = useState("group");
+  const [mode, setMode] = useState("one");
   const [entryMode, setEntryMode] = useState("tap");
   const [numV, setNumV] = useState({ dir: "LOW", val: "" });
   const [numH, setNumH] = useState({ dir: "LEFT", val: "" });
@@ -771,8 +771,8 @@ function AppInner() {
                   : entryMode === "tap" ? "Tap where your shots hit" : "Type your group offset"}
               </Label>
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                <Chip active={mode === "group"} onClick={() => switchMode("group")} title="Fire a group, dial off its center">group</Chip>
                 <Chip active={mode === "one"} onClick={() => switchMode("one")} title="Dial after every single shot">one shot</Chip>
+                <Chip active={mode === "group"} onClick={() => switchMode("group")} title="Fire a group, dial off its center">group</Chip>
                 <span style={{ width: 6 }} />
                 <Chip active={entryMode === "tap"} onClick={() => setEntryMode("tap")}>tap</Chip>
                 <Chip active={entryMode === "type"} onClick={() => setEntryMode("type")}>type</Chip>
