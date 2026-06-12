@@ -8,6 +8,7 @@ Built as a mobile-first PWA-style web app designed to be used at the range.
 
 ### Zero Tab
 - **Interactive splatter target** — tap where your shots landed on a Shoot-N-C-style target, or type offsets manually
+- **One-shot mode** — walk your zero in shot-by-shot, with a ghost trail showing convergence; group mode keeps the statistical centroid workflow
 - **Instant click calculations** — converts point-of-impact offset to turret clicks using the selected optic's MOA-per-click value
 - **Residual error display** — shows how much offset remains after rounding to the nearest whole click
 - **Predicted POI** — visualizes where your next group should land after dialing the recommended adjustment

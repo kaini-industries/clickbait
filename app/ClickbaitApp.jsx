@@ -48,6 +48,23 @@ const PRESET_PROFILES = [
   },
 ];
 
+/* rotation helpers — `rot` is a sparse map: a missing direction key
+   means "follow the arrow marked on the turret" for that axis */
+const CW = "clockwise", CCW = "counter-clockwise";
+const OPP_DIR = { UP: "DOWN", DOWN: "UP", LEFT: "RIGHT", RIGHT: "LEFT" };
+const oppRot = (r) => (r === CW ? CCW : CW);
+const turnFor = (rot, dir) =>
+  rot?.[dir] ?? (rot?.[OPP_DIR[dir]] ? oppRot(rot[OPP_DIR[dir]]) : null);
+const rotToSel = (rot, anchor) =>
+  !rot?.[anchor] && !rot?.[OPP_DIR[anchor]] ? "marked"
+  : turnFor(rot, anchor) === CW ? "cw" : "ccw";
+const buildRot = (elevSel, windSel) => {
+  const m = {};
+  if (elevSel !== "marked") { m.UP = elevSel === "cw" ? CW : CCW; m.DOWN = oppRot(m.UP); }
+  if (windSel !== "marked") { m.RIGHT = windSel === "cw" ? CW : CCW; m.LEFT = oppRot(m.RIGHT); }
+  return Object.keys(m).length ? m : null;
+};
+
 const UNITS = {
   imp: {
     lin: "in", dist: "yd",
@@ -131,6 +148,35 @@ function Card({ children, style }) {
   );
 }
 
+/* circular-arrow glyph; drawn clockwise, mirrored for counter-clockwise */
+function RotGlyph({ ccw, size = 30, style }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 32 32"
+      aria-hidden="true"
+      style={{ flexShrink: 0, transform: ccw ? "scaleX(-1)" : undefined, ...style }}
+    >
+      <path
+        d="M 23.8 7.3 A 11 11 0 1 0 27 16"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="3.2"
+        strokeLinecap="round"
+      />
+      <path
+        d="M 19.6 2.6 L 25.4 8.6 L 17.8 10.4"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="3.2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 /* ---------- the splatter target ---------- */
 
 const TARGET_SVG_STYLE = {
@@ -145,7 +191,7 @@ const TARGET_SVG_STYLE = {
   marginTop: 12,
 };
 
-const Target = memo(function Target({ span, gridStep, lin, shots, center, predicted, onTap }) {
+const Target = memo(function Target({ span, gridStep, lin, shots, ghosts = [], center, predicted, onTap }) {
   const S = 340;
   const px = (u) => S / 2 + (u * S) / span;
   const py = (u) => S / 2 - (u * S) / span;
@@ -207,6 +253,11 @@ const Target = memo(function Target({ span, gridStep, lin, shots, center, predic
       </g>
       <circle cx={S / 2} cy={S / 2} r={2.4} fill={C.paper} />
 
+      {/* ghosts: already-dialed shots from the walk-in */}
+      {ghosts.map((s, i) => (
+        <circle key={`g${i}`} cx={px(s.x)} cy={py(s.y)} r={holeR} fill={C.ink} stroke={C.paper} strokeWidth={1.5} opacity={0.4} />
+      ))}
+
       {/* shots: splatter ring + bullet hole */}
       {shots.map((s, i) => (
         <g key={i}>
@@ -244,6 +295,7 @@ const Target = memo(function Target({ span, gridStep, lin, shots, center, predic
 
 function AdjustRow({ axis, clicks, dir, rot, lin, residual }) {
   const arrows = { UP: "↑", DOWN: "↓", LEFT: "←", RIGHT: "→" };
+  const turn = turnFor(rot, dir);
   return (
     <div style={{ padding: "10px 0", borderBottom: `1px dashed ${C.grid}` }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
@@ -262,9 +314,32 @@ function AdjustRow({ axis, clicks, dir, rot, lin, residual }) {
         )}
       </div>
       {clicks > 0 && (
-        <div style={{ fontFamily: FONT_MONO, fontSize: 12.5, color: C.inkSoft, marginTop: 2, paddingLeft: 86 }}>
-          {rot ? `turn the screw ${rot[dir]}` : `turn toward the ${dir} arrow on the turret`}
-          {residual > 0.05 && ` · ~${fmt(residual, 1)} ${lin} will remain`}
+        <div style={{ marginTop: 6, paddingLeft: 86 }}>
+          <div
+            style={{
+              display: "inline-flex", alignItems: "center", gap: 8,
+              border: `2px solid ${C.ink}`, borderRadius: 4,
+              background: C.card, padding: "5px 12px 5px 9px", color: C.ink,
+            }}
+          >
+            {turn ? (
+              <>
+                <RotGlyph ccw={turn === CCW} />
+                <span style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 19, letterSpacing: "0.06em" }}>
+                  TURN {turn === CW ? "CLOCKWISE" : "COUNTER-CLOCKWISE"}
+                </span>
+              </>
+            ) : (
+              <span style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 17, letterSpacing: "0.06em" }}>
+                TURN TOWARD THE “{dir}” ARROW
+              </span>
+            )}
+          </div>
+          {residual > 0.05 && (
+            <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.inkSoft, marginTop: 4 }}>
+              ~{fmt(residual, 1)} {lin} will remain
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -308,6 +383,8 @@ function AppInner() {
   const [distance, setDistance] = useState(25);
   const [span, setSpan] = useState(12);
   const [shots, setShots] = useState([]);
+  const [ghosts, setGhosts] = useState([]);
+  const [mode, setMode] = useState("group");
   const [entryMode, setEntryMode] = useState("tap");
   const [numV, setNumV] = useState({ dir: "LOW", val: "" });
   const [numH, setNumH] = useState({ dir: "LEFT", val: "" });
@@ -316,7 +393,19 @@ function AppInner() {
   const [counter, setCounter] = useState({ turret: "ELEVATION", count: 0, done: false });
   const saveTimer = useRef(null);
   const loadedRef = useRef(false);
-  const handleTargetTap = useCallback((pt) => setShots((s) => [...s, pt]), []);
+  const handleTargetTap = useCallback(
+    (pt) => setShots((s) => (mode === "one" ? [pt] : [...s, pt])),
+    [mode]
+  );
+
+  const switchMode = (m) => {
+    if (m === mode) return;
+    setMode(m);
+    setShots([]);
+    setGhosts([]);
+    setNumV({ dir: "LOW", val: "" });
+    setNumH({ dir: "LEFT", val: "" });
+  };
 
   const U = UNITS[units];
   const profile = profiles.find((p) => p.id === activeId) || profiles[0];
@@ -333,6 +422,7 @@ function AppInner() {
         if (s.distance) setDistance(s.distance);
         if (s.span) setSpan(s.span);
         if (s.log) setLog(s.log);
+        if (s.mode) setMode(s.mode);
       }
     } catch (e) {
       /* first run — nothing saved yet */
@@ -348,12 +438,12 @@ function AppInner() {
       try {
         localStorage.setItem(
           "clickbait-v1",
-          JSON.stringify({ profiles, activeId, units, distance, span, log })
+          JSON.stringify({ profiles, activeId, units, distance, span, log, mode })
         );
       } catch (e) {}
     }, 400);
     return () => clearTimeout(saveTimer.current);
-  }, [profiles, activeId, units, distance, span, log, loaded]);
+  }, [profiles, activeId, units, distance, span, log, mode, loaded]);
 
   /* ----- unit switch keeps things sane ----- */
   const switchUnits = (u) => {
@@ -362,6 +452,7 @@ function AppInner() {
     setDistance(UNITS[u].distances[2] || UNITS[u].distances[0]);
     setSpan(UNITS[u].spans[1]);
     setShots([]);
+    setGhosts([]);
     setNumV({ dir: "LOW", val: "" });
     setNumH({ dir: "LEFT", val: "" });
   };
@@ -423,9 +514,11 @@ function AppInner() {
         e: calc.elevClicks ? `${calc.elevClicks}${calc.elevDir === "UP" ? "↑" : "↓"}` : "—",
         w: calc.windClicks ? `${calc.windClicks}${calc.windDir === "RIGHT" ? "→" : "←"}` : "—",
         grp: calc.groupSize ? `${fmt(calc.groupSize, 1)} ${U.lin}` : null,
+        one: mode === "one" || undefined,
       },
       ...l,
     ]);
+    if (mode === "one" && shots.length) setGhosts((g) => [...g, shots[0]]);
     setShots([]);
     setNumV({ dir: "LOW", val: "" });
     setNumH({ dir: "LEFT", val: "" });
@@ -563,6 +656,41 @@ function AppInner() {
                   style={{ width: "100%", marginTop: 4, padding: 10, border: `2px solid ${C.ink}`, borderRadius: 3, fontSize: 14, background: C.paper }}
                 />
               </label>
+              {[
+                { lbl: "Elevation screw", anchor: "UP", key: "elev" },
+                { lbl: "Windage screw", anchor: "RIGHT", key: "wind" },
+              ].map(({ lbl, anchor, key }) => {
+                const sel = rotToSel(profile.rot, anchor);
+                return (
+                  <div key={key} style={{ gridColumn: "1 / -1" }}>
+                    <div style={{ fontFamily: FONT_MONO, fontSize: 12, marginBottom: 4 }}>{lbl}</div>
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      {[["cw", `${anchor} = CW`], ["ccw", `${anchor} = CCW`], ["marked", "marked on turret"]].map(([v, txt]) => (
+                        <Chip
+                          key={v}
+                          active={sel === v}
+                          onClick={() =>
+                            updateProfile({
+                              rot: buildRot(
+                                key === "elev" ? v : rotToSel(profile.rot, "UP"),
+                                key === "wind" ? v : rotToSel(profile.rot, "RIGHT")
+                              ),
+                            })
+                          }
+                        >
+                          <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                            {v !== "marked" && <RotGlyph ccw={v === "ccw"} size={15} />}
+                            {txt}
+                          </span>
+                        </Chip>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+              <div style={{ gridColumn: "1 / -1", fontFamily: FONT_MONO, fontSize: 11.5, color: C.inkSoft }}>
+                CW/CCW = which way the screw turns to move impact UP / RIGHT. Check your optic's manual.
+              </div>
             </div>
             <div style={{ display: "flex", gap: 12, marginTop: 10 }}>
               {!profile.builtin && (
@@ -638,9 +766,14 @@ function AppInner() {
 
             <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 6, marginTop: 20 }}>
               <Label>
-                {entryMode === "tap" ? "Tap where your shots hit" : "Type your group offset"}
+                {mode === "one"
+                  ? entryMode === "tap" ? "Tap where your shot hit" : "Type your shot offset"
+                  : entryMode === "tap" ? "Tap where your shots hit" : "Type your group offset"}
               </Label>
-              <div style={{ display: "flex", gap: 6 }}>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                <Chip active={mode === "group"} onClick={() => switchMode("group")} title="Fire a group, dial off its center">group</Chip>
+                <Chip active={mode === "one"} onClick={() => switchMode("one")} title="Dial after every single shot">one shot</Chip>
+                <span style={{ width: 6 }} />
                 <Chip active={entryMode === "tap"} onClick={() => setEntryMode("tap")}>tap</Chip>
                 <Chip active={entryMode === "type"} onClick={() => setEntryMode("type")}>type</Chip>
               </div>
@@ -653,16 +786,23 @@ function AppInner() {
                   gridStep={U.gridStep[span] || 1}
                   lin={U.lin}
                   shots={shots}
+                  ghosts={mode === "one" ? ghosts : []}
                   center={calc ? { x: calc.cx, y: calc.cy } : null}
                   predicted={calc && !zeroed ? calc.predicted : null}
                   onTap={handleTargetTap}
                 />
                 <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center", flexWrap: "wrap" }}>
                   <Chip onClick={() => setShots((s) => s.slice(0, -1))}>undo</Chip>
-                  <Chip onClick={() => setShots([])}>clear</Chip>
+                  <Chip onClick={() => { setShots([]); setGhosts([]); }}>clear</Chip>
                   <span style={{ fontFamily: FONT_MONO, fontSize: 12.5, color: C.inkSoft }}>
-                    {shots.length} shot{shots.length === 1 ? "" : "s"}
-                    {calc && calc.groupSize != null && ` · group ${fmt(calc.groupSize, 1)} ${U.lin}`}
+                    {mode === "one" ? (
+                      <>shot #{ghosts.length + 1}{ghosts.length > 0 && ` · ${ghosts.length} dialed`}</>
+                    ) : (
+                      <>
+                        {shots.length} shot{shots.length === 1 ? "" : "s"}
+                        {calc && calc.groupSize != null && ` · group ${fmt(calc.groupSize, 1)} ${U.lin}`}
+                      </>
+                    )}
                   </span>
                   <div style={{ display: "flex", gap: 6, marginLeft: "auto" }}>
                     {U.spans.map((s) => (
@@ -693,7 +833,9 @@ function AppInner() {
                   </div>
                 ))}
                 <div style={{ fontFamily: FONT_MONO, fontSize: 11.5, color: C.inkSoft }}>
-                  Measure from the center of your group to your point of aim.
+                  {mode === "one"
+                    ? "Measure from your shot to your point of aim."
+                    : "Measure from the center of your group to your point of aim."}
                 </div>
               </Card>
             )}
@@ -703,7 +845,9 @@ function AppInner() {
             {!calc ? (
               <Card>
                 <div style={{ fontFamily: FONT_MONO, fontSize: 13.5, color: C.inkSoft }}>
-                  Fire a group of 3–5, then mark it above. Instructions appear here.
+                  {mode === "one"
+                    ? "Fire one shot, then mark it above. Dial, stamp, repeat — walk it in."
+                    : "Fire a group of 3–5, then mark it above. Instructions appear here."}
                 </div>
               </Card>
             ) : zeroed ? (
@@ -712,7 +856,9 @@ function AppInner() {
                   ZEROED <span style={{ color: C.splat, textShadow: `0 0 1px ${C.ink}` }}>◉</span>
                 </div>
                 <div style={{ fontFamily: FONT_MONO, fontSize: 12.5, color: C.inkSoft }}>
-                  Group center is within one click of point of aim. Send another group to confirm.
+                  {mode === "one"
+                    ? "Shot is within one click of point of aim. Confirm with a group before you call it zeroed."
+                    : "Group center is within one click of point of aim. Send another group to confirm."}
                 </div>
               </Card>
             ) : (
@@ -740,8 +886,13 @@ function AppInner() {
                   cursor: "pointer", boxShadow: `3px 3px 0 ${C.grid}`,
                 }}
               >
-                I DIALED IT — STAMP TO LOG
+                {mode === "one" ? "I DIALED IT — NEXT SHOT" : "I DIALED IT — STAMP TO LOG"}
               </button>
+            )}
+            {mode === "one" && (
+              <div style={{ fontFamily: FONT_MONO, fontSize: 11.5, color: C.inkSoft, marginTop: 8 }}>
+                One shot is one data point — wind, trigger, and ammo all lie. Confirm with a group when you're close.
+              </div>
             )}
           </div>
         )}
@@ -802,7 +953,11 @@ function AppInner() {
               <Card style={{ marginTop: 12 }}>
                 <div className="stamp">
                   <div style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 22 }}>
-                    Turn <span style={{ color: C.red }}>{Math.round(counter.count / 2)} clicks clockwise</span>
+                    Turn{" "}
+                    <span style={{ color: C.red }}>
+                      <RotGlyph size={24} style={{ verticalAlign: "middle", marginRight: 2 }} />
+                      {Math.round(counter.count / 2)} clicks clockwise
+                    </span>
                   </div>
                   <div style={{ fontFamily: FONT_MONO, fontSize: 13, color: C.inkSoft, marginTop: 4 }}>
                     That puts the {counter.turret.toLowerCase()} turret at its mechanical center ({counter.count} total ÷ 2). Repeat for the other turret, then mount and zero.
@@ -840,6 +995,7 @@ function AppInner() {
                     <div style={{ fontFamily: FONT_MONO, fontSize: 13.5, marginTop: 4 }}>
                       ELEV <b style={{ color: C.red }}>{e.e}</b> · WIND <b style={{ color: C.red }}>{e.w}</b>
                       {e.grp && <span style={{ color: C.inkSoft }}> · group {e.grp}</span>}
+                      {e.one && <span style={{ color: C.inkSoft }}> · one-shot</span>}
                     </div>
                   </Card>
                 ))}
