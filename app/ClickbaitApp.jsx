@@ -46,6 +46,15 @@ const PRESET_PROFILES = [
     rot: null, // direction arrows are marked on the turrets
     builtin: true,
   },
+  {
+    id: "ak47irons",
+    name: "AK-47 / AKM iron sights",
+    short: "AK irons",
+    type: "irons", // absent on all turret profiles
+    elev: { moaPerUnit: 6.9, step: 0.25, unit: "turn", maxUnits: 2 }, // ~20 cm @ 100 m per post turn; ±2 usable turns
+    wind: { moaPerUnit: 9.1, step: 0.1, unit: "mm", maxUnits: 3 }, // ~26 cm @ 100 m per mm of drift; ±3 mm dovetail
+    builtin: true,
+  },
 ];
 
 /* rotation helpers — `rot` is a sparse map: a missing direction key
@@ -63,6 +72,22 @@ const buildRot = (elevSel, windSel) => {
   if (elevSel !== "marked") { m.UP = elevSel === "cw" ? CW : CCW; m.DOWN = oppRot(m.UP); }
   if (windSel !== "marked") { m.RIGHT = windSel === "cw" ? CW : CCW; m.LEFT = oppRot(m.RIGHT); }
   return Object.keys(m).length ? m : null;
+};
+
+/* per-axis adjustment specs — a turret optic is the degenerate case where
+   both axes share one spec (1-click steps, half of travel each way) */
+const axisSpecs = (p) => {
+  if (p.type === "irons") return { elev: p.elev, wind: p.wind };
+  const s = { moaPerUnit: p.clickMOA, step: 1, unit: "click", maxUnits: p.travelMOA / p.clickMOA / 2 };
+  return { elev: s, wind: s };
+};
+
+/* front-sight zeroing is INVERTED: move the post/drum opposite the desired impact shift */
+const IRONS_ACTIONS = {
+  UP: { main: "SCREW FRONT POST DOWN (clockwise from above)", note: "lowering the post raises impact" },
+  DOWN: { main: "SCREW FRONT POST UP (counter-clockwise from above)", note: "raising the post lowers impact" },
+  RIGHT: { main: "DRIFT FRONT SIGHT DRUM LEFT", note: "moving the drum left moves impact right" },
+  LEFT: { main: "DRIFT FRONT SIGHT DRUM RIGHT", note: "moving the drum right moves impact left" },
 };
 
 const UNITS = {
@@ -86,6 +111,18 @@ const fmt = (n, p = 1) => {
   const v = Number(n.toFixed(p));
   return Object.is(v, -0) ? "0" : String(v);
 };
+
+const QUARTERS = ["", "¼", "½", "¾"];
+function fmtUnits(units, spec) {
+  if (spec.unit === "turn") {
+    const q = Math.round(units * 4); // integer quarter-turns
+    const whole = Math.floor(q / 4), frac = QUARTERS[q % 4];
+    const num = whole ? `${whole}${frac}` : frac || "0";
+    return `${num} ${units > 1 ? "turns" : "turn"}`; // "½ turn", "1¼ turns"
+  }
+  if (spec.unit === "mm") return `${fmt(units, 1)} mm`;
+  return `${units} ${units === 1 ? "click" : "clicks"}`;
+}
 
 /* ---------- small building blocks ---------- */
 
@@ -293,27 +330,29 @@ const Target = memo(function Target({ span, gridStep, lin, shots, ghosts = [], c
 
 /* ---------- results ticket ---------- */
 
-function AdjustRow({ axis, clicks, dir, rot, lin, residual }) {
+function AdjustRow({ axis, result, type, rot, lin }) {
   const arrows = { UP: "↑", DOWN: "↓", LEFT: "←", RIGHT: "→" };
+  const { dir, steps, units, spec, residual } = result;
   const turn = turnFor(rot, dir);
+  const irons = type === "irons";
   return (
     <div style={{ padding: "10px 0", borderBottom: `1px dashed ${C.grid}` }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
         <span style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 14, letterSpacing: "0.12em", color: C.inkSoft, width: 86 }}>
           {axis}
         </span>
-        {clicks === 0 ? (
+        {steps === 0 ? (
           <span style={{ fontFamily: FONT_MONO, fontWeight: 600, fontSize: 18, color: C.ink }}>HOLD — no change</span>
         ) : (
           <span style={{ fontFamily: FONT_MONO, fontWeight: 600, fontSize: 26, color: C.ink }}>
-            {clicks} {clicks === 1 ? "click" : "clicks"}{" "}
+            {fmtUnits(units, spec)}{" "}
             <span style={{ color: C.red }}>
               {dir} {arrows[dir]}
             </span>
           </span>
         )}
       </div>
-      {clicks > 0 && (
+      {steps > 0 && (
         <div style={{ marginTop: 6, paddingLeft: 86 }}>
           <div
             style={{
@@ -322,7 +361,11 @@ function AdjustRow({ axis, clicks, dir, rot, lin, residual }) {
               background: C.card, padding: "5px 12px 5px 9px", color: C.ink,
             }}
           >
-            {turn ? (
+            {irons ? (
+              <span style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 17, letterSpacing: "0.06em" }}>
+                {IRONS_ACTIONS[dir].main}
+              </span>
+            ) : turn ? (
               <>
                 <RotGlyph ccw={turn === CCW} />
                 <span style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 19, letterSpacing: "0.06em" }}>
@@ -335,6 +378,11 @@ function AdjustRow({ axis, clicks, dir, rot, lin, residual }) {
               </span>
             )}
           </div>
+          {irons && (
+            <div style={{ fontFamily: FONT_MONO, fontSize: 11.5, color: C.inkSoft, marginTop: 4 }}>
+              {IRONS_ACTIONS[dir].note}
+            </div>
+          )}
           {residual > 0.05 && (
             <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.inkSoft, marginTop: 4 }}>
               ~{fmt(residual, 1)} {lin} will remain
@@ -416,7 +464,11 @@ function AppInner() {
       const raw = localStorage.getItem("clickbait-v1");
       if (raw) {
         const s = JSON.parse(raw);
-        if (s.profiles && s.profiles.length) setProfiles(s.profiles);
+        if (s.profiles && s.profiles.length) {
+          // append any presets the saved list doesn't know about yet
+          const saved = s.profiles;
+          setProfiles([...saved, ...PRESET_PROFILES.filter((p) => !saved.some((x) => x.id === p.id))]);
+        }
         if (s.activeId) setActiveId(s.activeId);
         if (s.units) setUnits(s.units);
         if (s.distance) setDistance(s.distance);
@@ -471,19 +523,26 @@ function AppInner() {
     }
     if (cx === null) return null;
 
-    const perClick = profile.clickMOA * U.perMOA(distance); // linear units per click
-    if (!perClick || !isFinite(perClick)) return null;
-
-    const elevDir = cy <= 0 ? "UP" : "DOWN";
-    const windDir = cx <= 0 ? "RIGHT" : "LEFT";
-    const elevClicks = Math.round(Math.abs(cy) / perClick);
-    const windClicks = Math.round(Math.abs(cx) / perClick);
-    const elevResidual = Math.abs(Math.abs(cy) - elevClicks * perClick);
-    const windResidual = Math.abs(Math.abs(cx) - windClicks * perClick);
+    const axes = axisSpecs(profile);
+    const solveAxis = (offset, dir, spec) => {
+      const perUnit = spec.moaPerUnit * U.perMOA(distance); // linear units per 1.0 unit
+      if (!perUnit || !isFinite(perUnit)) return null;
+      const steps = Math.round(Math.abs(offset) / (perUnit * spec.step)); // integer count of quanta
+      const units = steps * spec.step;
+      return {
+        dir, steps, units, spec, perUnit,
+        move: units * perUnit, // linear correction applied
+        residual: Math.abs(Math.abs(offset) - units * perUnit),
+        overTravel: units > spec.maxUnits,
+      };
+    };
+    const elev = solveAxis(cy, cy <= 0 ? "UP" : "DOWN", axes.elev);
+    const wind = solveAxis(cx, cx <= 0 ? "RIGHT" : "LEFT", axes.wind);
+    if (!elev || !wind) return null;
 
     const predicted = {
-      x: cx + (windDir === "RIGHT" ? 1 : -1) * windClicks * perClick,
-      y: cy + (elevDir === "UP" ? 1 : -1) * elevClicks * perClick,
+      x: cx + (wind.dir === "RIGHT" ? 1 : -1) * wind.move,
+      y: cy + (elev.dir === "UP" ? 1 : -1) * elev.move,
     };
 
     let groupSize = null;
@@ -495,13 +554,10 @@ function AppInner() {
       groupSize = m;
     }
 
-    const halfTravelClicks = Math.round(profile.travelMOA / profile.clickMOA / 2);
-    const beyondHalfTravel = Math.max(elevClicks, windClicks) > halfTravelClicks;
-
-    return { cx, cy, perClick, elevDir, windDir, elevClicks, windClicks, elevResidual, windResidual, predicted, groupSize, halfTravelClicks, beyondHalfTravel };
+    return { cx, cy, elev, wind, predicted, groupSize };
   }, [shots, entryMode, numV, numH, profile, distance, units]);
 
-  const zeroed = calc && calc.elevClicks === 0 && calc.windClicks === 0;
+  const zeroed = calc && calc.elev.steps === 0 && calc.wind.steps === 0;
 
   const stampLog = () => {
     if (!calc) return;
@@ -511,8 +567,12 @@ function AppInner() {
         ts: Date.now(),
         optic: profile.short,
         dist: `${distance} ${U.dist}`,
-        e: calc.elevClicks ? `${calc.elevClicks}${calc.elevDir === "UP" ? "↑" : "↓"}` : "—",
-        w: calc.windClicks ? `${calc.windClicks}${calc.windDir === "RIGHT" ? "→" : "←"}` : "—",
+        e: calc.elev.steps
+          ? `${calc.elev.spec.unit === "click" ? calc.elev.units : fmtUnits(calc.elev.units, calc.elev.spec)}${calc.elev.dir === "UP" ? "↑" : "↓"}`
+          : "—",
+        w: calc.wind.steps
+          ? `${calc.wind.spec.unit === "click" ? calc.wind.units : fmtUnits(calc.wind.units, calc.wind.spec)}${calc.wind.dir === "RIGHT" ? "→" : "←"}`
+          : "—",
         grp: calc.groupSize ? `${fmt(calc.groupSize, 1)} ${U.lin}` : null,
         one: mode === "one" || undefined,
       },
@@ -528,6 +588,8 @@ function AppInner() {
   const updateProfile = (patch) => {
     if (patch.clickMOA !== undefined) patch = { ...patch, clickMOA: Math.max(0.05, patch.clickMOA) };
     if (patch.travelMOA !== undefined) patch = { ...patch, travelMOA: Math.max(10, patch.travelMOA) };
+    if (patch.elev !== undefined) patch = { ...patch, elev: { ...patch.elev, moaPerUnit: Math.max(0.5, patch.elev.moaPerUnit) } };
+    if (patch.wind !== undefined) patch = { ...patch, wind: { ...patch.wind, moaPerUnit: Math.max(0.5, patch.wind.moaPerUnit) } };
 
     const target = profiles.find((p) => p.id === activeId);
     if (!target) return;
@@ -570,7 +632,7 @@ function AppInner() {
   };
 
   /* ----- counter helpers ----- */
-  const lockToLock = Math.round(profile.travelMOA / profile.clickMOA);
+  const lockToLock = profile.type === "irons" ? 0 : Math.round(profile.travelMOA / profile.clickMOA);
   const bump = (n) => setCounter((c) => ({ ...c, count: Math.max(0, c.count + n), done: false }));
 
   /* ============================ render ============================ */
@@ -617,7 +679,12 @@ function AppInner() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8, flexWrap: "wrap" }}>
           <span style={{ fontFamily: FONT_MONO, fontSize: 12.5, color: C.inkSoft }}>
-            {profile.name} · <b style={{ color: C.ink }}>{profile.clickMOA} MOA/click</b>
+            {profile.name} ·{" "}
+            <b style={{ color: C.ink }}>
+              {profile.type === "irons"
+                ? `${profile.elev.moaPerUnit} MOA/turn · ${profile.wind.moaPerUnit} MOA/mm`
+                : `${profile.clickMOA} MOA/click`}
+            </b>
           </span>
           <button
             onClick={() => setEditing((e) => !e)}
@@ -638,59 +705,87 @@ function AppInner() {
                   style={{ width: "100%", marginTop: 4, padding: 10, border: `2px solid ${C.ink}`, borderRadius: 3, fontSize: 14, background: C.paper }}
                 />
               </label>
-              <label style={{ fontFamily: FONT_MONO, fontSize: 12 }}>
-                MOA per click
-                <input
-                  type="number" step="0.05" min="0.05" inputMode="decimal"
-                  value={profile.clickMOA}
-                  onChange={(e) => updateProfile({ clickMOA: parseFloat(e.target.value) || 0.25 })}
-                  style={{ width: "100%", marginTop: 4, padding: 10, border: `2px solid ${C.ink}`, borderRadius: 3, fontSize: 14, background: C.paper }}
-                />
-              </label>
-              <label style={{ fontFamily: FONT_MONO, fontSize: 12 }}>
-                Total travel (MOA)
-                <input
-                  type="number" step="5" min="10" inputMode="numeric"
-                  value={profile.travelMOA}
-                  onChange={(e) => updateProfile({ travelMOA: parseFloat(e.target.value) || 60 })}
-                  style={{ width: "100%", marginTop: 4, padding: 10, border: `2px solid ${C.ink}`, borderRadius: 3, fontSize: 14, background: C.paper }}
-                />
-              </label>
-              {[
-                { lbl: "Elevation screw", anchor: "UP", key: "elev" },
-                { lbl: "Windage screw", anchor: "RIGHT", key: "wind" },
-              ].map(({ lbl, anchor, key }) => {
-                const sel = rotToSel(profile.rot, anchor);
-                return (
-                  <div key={key} style={{ gridColumn: "1 / -1" }}>
-                    <div style={{ fontFamily: FONT_MONO, fontSize: 12, marginBottom: 4 }}>{lbl}</div>
-                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                      {[["cw", `${anchor} = CW`], ["ccw", `${anchor} = CCW`], ["marked", "marked on turret"]].map(([v, txt]) => (
-                        <Chip
-                          key={v}
-                          active={sel === v}
-                          onClick={() =>
-                            updateProfile({
-                              rot: buildRot(
-                                key === "elev" ? v : rotToSel(profile.rot, "UP"),
-                                key === "wind" ? v : rotToSel(profile.rot, "RIGHT")
-                              ),
-                            })
-                          }
-                        >
-                          <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
-                            {v !== "marked" && <RotGlyph ccw={v === "ccw"} size={15} />}
-                            {txt}
-                          </span>
-                        </Chip>
-                      ))}
-                    </div>
+              {profile.type === "irons" ? (
+                <>
+                  <label style={{ fontFamily: FONT_MONO, fontSize: 12 }}>
+                    MOA per turn (front post)
+                    <input
+                      type="number" step="0.1" min="0.5" inputMode="decimal"
+                      value={profile.elev.moaPerUnit}
+                      onChange={(e) => updateProfile({ elev: { ...profile.elev, moaPerUnit: parseFloat(e.target.value) || 6.9 } })}
+                      style={{ width: "100%", marginTop: 4, padding: 10, border: `2px solid ${C.ink}`, borderRadius: 3, fontSize: 14, background: C.paper }}
+                    />
+                  </label>
+                  <label style={{ fontFamily: FONT_MONO, fontSize: 12 }}>
+                    MOA per mm of drift
+                    <input
+                      type="number" step="0.1" min="0.5" inputMode="decimal"
+                      value={profile.wind.moaPerUnit}
+                      onChange={(e) => updateProfile({ wind: { ...profile.wind, moaPerUnit: parseFloat(e.target.value) || 9.1 } })}
+                      style={{ width: "100%", marginTop: 4, padding: 10, border: `2px solid ${C.ink}`, borderRadius: 3, fontSize: 14, background: C.paper }}
+                    />
+                  </label>
+                  <div style={{ gridColumn: "1 / -1", fontFamily: FONT_MONO, fontSize: 11.5, color: C.inkSoft }}>
+                    MOA per turn depends on sight radius and thread pitch — ~6.9 for AKM-pattern (378 mm radius, M6×0.75). Shorter rifles (AKS-74U etc.) differ.
                   </div>
-                );
-              })}
-              <div style={{ gridColumn: "1 / -1", fontFamily: FONT_MONO, fontSize: 11.5, color: C.inkSoft }}>
-                CW/CCW = which way the screw turns to move impact UP / RIGHT. Check your optic's manual.
-              </div>
+                </>
+              ) : (
+                <>
+                  <label style={{ fontFamily: FONT_MONO, fontSize: 12 }}>
+                    MOA per click
+                    <input
+                      type="number" step="0.05" min="0.05" inputMode="decimal"
+                      value={profile.clickMOA}
+                      onChange={(e) => updateProfile({ clickMOA: parseFloat(e.target.value) || 0.25 })}
+                      style={{ width: "100%", marginTop: 4, padding: 10, border: `2px solid ${C.ink}`, borderRadius: 3, fontSize: 14, background: C.paper }}
+                    />
+                  </label>
+                  <label style={{ fontFamily: FONT_MONO, fontSize: 12 }}>
+                    Total travel (MOA)
+                    <input
+                      type="number" step="5" min="10" inputMode="numeric"
+                      value={profile.travelMOA}
+                      onChange={(e) => updateProfile({ travelMOA: parseFloat(e.target.value) || 60 })}
+                      style={{ width: "100%", marginTop: 4, padding: 10, border: `2px solid ${C.ink}`, borderRadius: 3, fontSize: 14, background: C.paper }}
+                    />
+                  </label>
+                  {[
+                    { lbl: "Elevation screw", anchor: "UP", key: "elev" },
+                    { lbl: "Windage screw", anchor: "RIGHT", key: "wind" },
+                  ].map(({ lbl, anchor, key }) => {
+                    const sel = rotToSel(profile.rot, anchor);
+                    return (
+                      <div key={key} style={{ gridColumn: "1 / -1" }}>
+                        <div style={{ fontFamily: FONT_MONO, fontSize: 12, marginBottom: 4 }}>{lbl}</div>
+                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                          {[["cw", `${anchor} = CW`], ["ccw", `${anchor} = CCW`], ["marked", "marked on turret"]].map(([v, txt]) => (
+                            <Chip
+                              key={v}
+                              active={sel === v}
+                              onClick={() =>
+                                updateProfile({
+                                  rot: buildRot(
+                                    key === "elev" ? v : rotToSel(profile.rot, "UP"),
+                                    key === "wind" ? v : rotToSel(profile.rot, "RIGHT")
+                                  ),
+                                })
+                              }
+                            >
+                              <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                                {v !== "marked" && <RotGlyph ccw={v === "ccw"} size={15} />}
+                                {txt}
+                              </span>
+                            </Chip>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                  <div style={{ gridColumn: "1 / -1", fontFamily: FONT_MONO, fontSize: 11.5, color: C.inkSoft }}>
+                    CW/CCW = which way the screw turns to move impact UP / RIGHT. Check your optic's manual.
+                  </div>
+                </>
+              )}
             </div>
             <div style={{ display: "flex", gap: 12, marginTop: 10 }}>
               {!profile.builtin && (
@@ -709,7 +804,7 @@ function AppInner() {
         <div style={{ display: "flex", gap: 6, marginTop: 18, borderBottom: `2px solid ${C.ink}` }}>
           {[
             ["zero", "ZERO TARGET"],
-            ["center", "CENTER TURRETS"],
+            ["center", profile.type === "irons" ? "SIGHT SETUP" : "CENTER TURRETS"],
             ["log", `DOPE LOG${log.length ? ` (${log.length})` : ""}`],
           ].map(([id, label]) => (
             <button
@@ -857,22 +952,45 @@ function AppInner() {
                 </div>
                 <div style={{ fontFamily: FONT_MONO, fontSize: 12.5, color: C.inkSoft }}>
                   {mode === "one"
-                    ? "Shot is within one click of point of aim. Confirm with a group before you call it zeroed."
-                    : "Group center is within one click of point of aim. Send another group to confirm."}
+                    ? "Shot is within one adjustment of point of aim. Confirm with a group before you call it zeroed."
+                    : "Group center is within one adjustment of point of aim. Send another group to confirm."}
                 </div>
               </Card>
             ) : (
-              <Card key={`${calc.elevClicks}-${calc.windClicks}-${calc.elevDir}-${calc.windDir}`}>
+              <Card key={`${calc.elev.steps}${calc.elev.dir}-${calc.wind.steps}${calc.wind.dir}`}>
                 <div className="stamp">
-                  <AdjustRow axis="ELEVATION" clicks={calc.elevClicks} dir={calc.elevDir} rot={profile.rot} lin={U.lin} residual={calc.elevResidual} />
-                  <AdjustRow axis="WINDAGE" clicks={calc.windClicks} dir={calc.windDir} rot={profile.rot} lin={U.lin} residual={calc.windResidual} />
-                  <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.inkSoft, marginTop: 10 }}>
-                    1 click = {fmt(calc.perClick, 2)} {U.lin} at {distance} {U.dist} · dashed white ring shows where the next group should land
-                  </div>
-                  {calc.beyondHalfTravel && (
-                    <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.red, marginTop: 6, padding: "6px 10px", border: `1px solid ${C.red}`, borderRadius: 3 }}>
-                      ⚠ Adjustment exceeds half-travel ({calc.halfTravelClicks} clicks) — turret may not have enough range.
+                  <AdjustRow axis="ELEVATION" result={calc.elev} type={profile.type} rot={profile.rot} lin={U.lin} />
+                  <AdjustRow axis="WINDAGE" result={calc.wind} type={profile.type} rot={profile.rot} lin={U.lin} />
+                  {profile.type === "irons" && (
+                    <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.inkSoft, marginTop: 10 }}>
+                      Adjust the FRONT sight only — set the rear leaf to its zeroing notch ("1" = 100 m) and leave it there.
                     </div>
+                  )}
+                  <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.inkSoft, marginTop: profile.type === "irons" ? 6 : 10 }}>
+                    {profile.type === "irons"
+                      ? `${fmtUnits(calc.elev.spec.step, calc.elev.spec)} = ${fmt(calc.elev.spec.step * calc.elev.perUnit, 2)} ${U.lin} · ${fmtUnits(calc.wind.spec.step, calc.wind.spec)} = ${fmt(calc.wind.spec.step * calc.wind.perUnit, 2)} ${U.lin}`
+                      : `1 click = ${fmt(calc.elev.perUnit, 2)} ${U.lin}`}{" "}
+                    at {distance} {U.dist} · dashed white ring shows where the next group should land
+                  </div>
+                  {profile.type === "irons" ? (
+                    <>
+                      {calc.elev.overTravel && (
+                        <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.red, marginTop: 6, padding: "6px 10px", border: `1px solid ${C.red}`, borderRadius: 3 }}>
+                          ⚠ ELEVATION exceeds usable front-post travel (~{calc.elev.spec.maxUnits} turns) — check mounting and canting before cranking further.
+                        </div>
+                      )}
+                      {calc.wind.overTravel && (
+                        <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.red, marginTop: 6, padding: "6px 10px", border: `1px solid ${C.red}`, borderRadius: 3 }}>
+                          ⚠ WINDAGE exceeds usable dovetail travel (~{calc.wind.spec.maxUnits} mm).
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    (calc.elev.overTravel || calc.wind.overTravel) && (
+                      <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.red, marginTop: 6, padding: "6px 10px", border: `1px solid ${C.red}`, borderRadius: 3 }}>
+                        ⚠ Adjustment exceeds half-travel ({Math.round(calc.elev.spec.maxUnits)} clicks) — turret may not have enough range.
+                      </div>
+                    )
                   )}
                 </div>
               </Card>
@@ -898,7 +1016,26 @@ function AppInner() {
         )}
 
         {/* ================= CENTER TAB ================= */}
-        {tab === "center" && (
+        {tab === "center" && profile.type === "irons" && (
+          <div>
+            <Label>Sight setup</Label>
+            <Card>
+              <div style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 22 }}>No turrets to center.</div>
+              <div style={{ fontFamily: FONT_MONO, fontSize: 13.5, lineHeight: 1.7, marginTop: 8 }}>
+                Iron sights have no detents or mechanical center. To start from a known baseline:
+                <ol style={{ margin: "8px 0 0", paddingLeft: 20 }}>
+                  <li>Center the windage drum in its dovetail — line up the factory witness mark.</li>
+                  <li>Screw the front post to roughly mid-thread.</li>
+                  <li>Set the rear leaf to "1" (100 m) for zeroing.</li>
+                </ol>
+              </div>
+              <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.inkSoft, marginTop: 8 }}>
+                Then zero on the ZERO TARGET tab.
+              </div>
+            </Card>
+          </div>
+        )}
+        {tab === "center" && profile.type !== "irons" && (
           <div>
             <Label>Turret</Label>
             <div style={{ display: "flex", gap: 8 }}>
@@ -1012,7 +1149,7 @@ function AppInner() {
 
         {/* footer */}
         <footer style={{ marginTop: 26, fontFamily: FONT_MONO, fontSize: 11, lineHeight: 1.6, color: C.inkSoft, borderTop: `1px dashed ${C.grid}`, paddingTop: 10 }}>
-          Click values preloaded from manufacturer manuals (HS507C-X2: 1 MOA · SLx 3×32 Gen III: ¼ MOA) — verify against your own manual; specs vary by model revision. Follow all range safety rules. 1 MOA = 1.047 in at 100 yd / 2.908 cm at 100 m.
+          Click values preloaded from manufacturer manuals (HS507C-X2: 1 MOA · SLx 3×32 Gen III: ¼ MOA) — verify against your own manual; specs vary by model revision. AK irons: ~6.9 MOA per front-post turn / ~9.1 MOA per mm of drift (AKM-pattern sight radius — verify on your rifle). Follow all range safety rules. 1 MOA = 1.047 in at 100 yd / 2.908 cm at 100 m.
         </footer>
       </div>
     </div>
