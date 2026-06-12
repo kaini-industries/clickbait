@@ -455,6 +455,15 @@ function AppInner() {
     setNumH({ dir: "LEFT", val: "" });
   };
 
+  const switchOptic = (id) => {
+    if (id === activeId) return;
+    setActiveId(id);
+    setShots([]);
+    setGhosts([]);
+    setNumV({ dir: "LOW", val: "" });
+    setNumH({ dir: "LEFT", val: "" });
+  };
+
   const U = UNITS[units];
   const profile = profiles.find((p) => p.id === activeId) || profiles[0];
 
@@ -613,14 +622,14 @@ function AppInner() {
   const addCustom = () => {
     const id = "custom-" + crypto.randomUUID();
     setProfiles((ps) => [...ps, { id, name: "Custom optic", short: "Custom", clickMOA: 0.5, travelMOA: 80, rot: null }]);
-    setActiveId(id);
+    switchOptic(id);
     setEditing(true);
   };
 
   const deleteProfile = () => {
     if (profile.builtin) return;
     setProfiles((ps) => ps.filter((p) => p.id !== activeId));
-    setActiveId(PRESET_PROFILES[0].id);
+    switchOptic(PRESET_PROFILES[0].id);
     setEditing(false);
   };
 
@@ -671,7 +680,7 @@ function AppInner() {
         <Label>Optic</Label>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           {profiles.map((p) => (
-            <Chip key={p.id} active={p.id === activeId} onClick={() => { setActiveId(p.id); setEditing(false); }}>
+            <Chip key={p.id} active={p.id === activeId} onClick={() => { switchOptic(p.id); setEditing(false); }}>
               {p.short}
             </Chip>
           ))}
