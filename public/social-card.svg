@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
+  <title id="title">Clickbait sight-in and turret assistant</title>
+  <desc id="desc">Range notebook paper with Clickbait title and a splatter target</desc>
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#c9d2c4" stroke-width="2"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="630" fill="#f4f4ec"/>
+  <rect width="1200" height="630" fill="url(#grid)"/>
+  <path d="M70 78h710v474H70z" fill="#fbfbf5" stroke="#161914" stroke-width="8"/>
+  <text x="112" y="240" fill="#161914" font-family="Arial Narrow, sans-serif" font-size="132" font-weight="800" letter-spacing="3">CLICKBAIT</text>
+  <text x="118" y="306" fill="#c3271b" font-family="ui-monospace, monospace" font-size="30" font-weight="700" letter-spacing="4">SIGHT-IN + TURRET ASSISTANT</text>
+  <path d="M116 362h575" stroke="#161914" stroke-width="6"/>
+  <text x="118" y="420" fill="#4a5044" font-family="ui-monospace, monospace" font-size="26">CALCULATE THE CLICKS.</text>
+  <text x="118" y="462" fill="#4a5044" font-family="ui-monospace, monospace" font-size="26">DIAL WITH CONFIDENCE.</text>
+  <g transform="translate(950 315)">
+    <path fill="#c8f51f" d="m0-224 30 128 96-94-40 127 130-29-108 80 119 56-132-5 60 117-102-85-19 132L0 74l-91 96 35-130-129 33 106-83-121-51 132 2-64-115 104 82z"/>
+    <circle r="158" fill="#131311" stroke="#f4f4ec" stroke-width="16"/>
+    <circle r="91" fill="none" stroke="#c9d2c4" stroke-width="10"/>
+    <path d="M0-202v112M0 90v112M-202 0h112M90 0h112" stroke="#f4f4ec" stroke-width="18" stroke-linecap="round"/>
+    <circle r="34" fill="#c3271b" stroke="#f4f4ec" stroke-width="10"/>
+  </g>
+</svg>

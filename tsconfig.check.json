@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "incremental": false,
+    "types": ["node"]
+  },
+  "include": ["lib/**/*.mjs", "tests/**/*.mjs"],
+  "exclude": ["node_modules"]
+}

@@ -1,6 +1,48 @@
 "use client";
 
-import React, { useState, useEffect, useMemo, useRef, memo, useCallback } from "react";
+import React, {
+  useState,
+  useEffect,
+  useMemo,
+  useRef,
+  useCallback,
+} from "react";
+import AppTabs from "./clickbait/AppTabs";
+import CenterPanel from "./clickbait/CenterPanel";
+import LogPanel from "./clickbait/LogPanel";
+import OpticPanel from "./clickbait/OpticPanel";
+import ZeroPanel, { describeAdjustmentForSpeech } from "./clickbait/ZeroPanel";
+import { C, FONT_HEAD, FONT_MONO, fmt, fmtUnits } from "./clickbait/ui";
+import {
+  COLLECTION_LIMITS,
+  UNIT_SYSTEMS,
+  appendBounded,
+  calculateAdjustment,
+  extremeSpread,
+  getMechanicalCenterGuidance,
+  groupCenter,
+  validateManualOffsets,
+} from "../lib/domain.mjs";
+import {
+  LEGACY_STORAGE_KEYS,
+  MAX_COUNTER_CLICKS,
+  STORAGE_KEY,
+  commitCounterSession,
+  commitFactoryReset,
+  commitLogAppend,
+  commitPersistedPatch,
+  commitProfileClone,
+  commitProfileDelete,
+  commitProfileUpsert,
+  commitProfilesReset,
+  createPersistenceDefaults,
+  createVersionedPayload,
+  getCounterSession,
+  loadPersistedPayload,
+  mergePersistedPayloads,
+  parsePersistedPayload,
+  savePersistedPayload,
+} from "../lib/persistence.mjs";
 
 /* ============================================================
    CLICKBAIT — sight-in & turret assistant
@@ -10,22 +52,19 @@ import React, { useState, useEffect, useMemo, useRef, memo, useCallback } from "
             splatter #C8F51F · stamp red #C3271B · black face #131311
    ============================================================ */
 
-const C = {
-  paper: "#F4F4EC",
-  grid: "#C9D2C4",
-  ink: "#161914",
-  inkSoft: "#4A5044",
-  face: "#131311",
-  faceRing: "#2C2C28",
-  splat: "#C8F51F",
-  red: "#C3271B",
-  orange: "#FF7A00",
-  white: "#FFFFFF",
-  card: "#FBFBF5",
-};
+const MAX_SHOTS = COLLECTION_LIMITS.shots;
+const MAX_GHOSTS = COLLECTION_LIMITS.ghosts;
+const MAX_PROFILES = COLLECTION_LIMITS.profiles;
+const TAB_IDS = ["zero", "center", "log"];
+const COORDINATION_DB = "clickbait-coordination";
+const COORDINATION_STORE = "locks";
 
-const FONT_HEAD = "var(--font-saira), 'Arial Narrow', system-ui, sans-serif";
-const FONT_MONO = "var(--font-ibm-plex-mono), ui-monospace, 'SF Mono', Menlo, monospace";
+class LockedOperationError extends Error {
+  constructor(cause) {
+    super(cause instanceof Error ? cause.message : "The saved-data operation failed.", { cause });
+    this.name = "LockedOperationError";
+  }
+}
 
 const PRESET_PROFILES = [
   {
@@ -43,7 +82,8 @@ const PRESET_PROFILES = [
     short: "SLx 3×32",
     clickMOA: 0.25,
     travelMOA: 60,
-    rot: null, // direction arrows are marked on the turrets
+    // Primary Arms' Gen III manual specifies clockwise for POI UP/RIGHT.
+    rot: { UP: "clockwise", DOWN: "counter-clockwise", RIGHT: "clockwise", LEFT: "counter-clockwise" },
     builtin: true,
   },
   {
@@ -57,365 +97,237 @@ const PRESET_PROFILES = [
   },
 ];
 
-/* rotation helpers — `rot` is a sparse map: a missing direction key
-   means "follow the arrow marked on the turret" for that axis */
-const CW = "clockwise", CCW = "counter-clockwise";
-const OPP_DIR = { UP: "DOWN", DOWN: "UP", LEFT: "RIGHT", RIGHT: "LEFT" };
-const oppRot = (r) => (r === CW ? CCW : CW);
-const turnFor = (rot, dir) =>
-  rot?.[dir] ?? (rot?.[OPP_DIR[dir]] ? oppRot(rot[OPP_DIR[dir]]) : null);
-const rotToSel = (rot, anchor) =>
-  !rot?.[anchor] && !rot?.[OPP_DIR[anchor]] ? "marked"
-  : turnFor(rot, anchor) === CW ? "cw" : "ccw";
-const buildRot = (elevSel, windSel) => {
-  const m = {};
-  if (elevSel !== "marked") { m.UP = elevSel === "cw" ? CW : CCW; m.DOWN = oppRot(m.UP); }
-  if (windSel !== "marked") { m.RIGHT = windSel === "cw" ? CW : CCW; m.LEFT = oppRot(m.RIGHT); }
-  return Object.keys(m).length ? m : null;
-};
-
-/* per-axis adjustment specs — a turret optic is the degenerate case where
-   both axes share one spec (1-click steps, half of travel each way) */
-const axisSpecs = (p) => {
-  if (p.type === "irons") return { elev: p.elev, wind: p.wind };
-  const s = { moaPerUnit: p.clickMOA, step: 1, unit: "click", maxUnits: p.travelMOA / p.clickMOA / 2 };
-  return { elev: s, wind: s };
-};
-
-/* front-sight zeroing is INVERTED: move the post/drum opposite the desired impact shift */
-const IRONS_ACTIONS = {
-  UP: { main: "SCREW FRONT POST DOWN (clockwise from above)", note: "lowering the post raises impact" },
-  DOWN: { main: "SCREW FRONT POST UP (counter-clockwise from above)", note: "raising the post lowers impact" },
-  RIGHT: { main: "DRIFT FRONT SIGHT DRUM LEFT", note: "moving the drum left moves impact right" },
-  LEFT: { main: "DRIFT FRONT SIGHT DRUM RIGHT", note: "moving the drum right moves impact left" },
-};
-
 const UNITS = {
   imp: {
-    lin: "in", dist: "yd",
-    perMOA: (d) => (1.047 * d) / 100,
-    distances: [10, 15, 25, 36, 50, 100],
-    spans: [6, 12, 24],
-    gridStep: { 6: 1, 12: 1, 24: 2 },
+    lin: UNIT_SYSTEMS.imp.linearUnit,
+    dist: UNIT_SYSTEMS.imp.distanceUnit,
+    distances: UNIT_SYSTEMS.imp.distances,
+    spans: UNIT_SYSTEMS.imp.spans,
+    gridStep: UNIT_SYSTEMS.imp.gridSteps,
   },
   met: {
-    lin: "cm", dist: "m",
-    perMOA: (d) => (2.908 * d) / 100,
-    distances: [10, 25, 50, 100],
-    spans: [15, 30, 60],
-    gridStep: { 15: 1, 30: 2, 60: 5 },
+    lin: UNIT_SYSTEMS.met.linearUnit,
+    dist: UNIT_SYSTEMS.met.distanceUnit,
+    distances: UNIT_SYSTEMS.met.distances,
+    spans: UNIT_SYSTEMS.met.spans,
+    gridStep: UNIT_SYSTEMS.met.gridSteps,
   },
 };
 
-const fmt = (n, p = 1) => {
-  const v = Number(n.toFixed(p));
-  return Object.is(v, -0) ? "0" : String(v);
+const PERSISTENCE_DEFAULTS = createPersistenceDefaults({ profiles: PRESET_PROFILES });
+
+const calculationProfileSignature = (profile) => JSON.stringify(profile ? {
+  id: profile.id,
+  type: profile.type ?? "turret",
+  clickMOA: profile.clickMOA,
+  travelMOA: profile.travelMOA,
+  elev: profile.elev,
+  wind: profile.wind,
+  rot: profile.rot,
+} : null);
+
+const removeLegacyCopies = () => {
+  try {
+    LEGACY_STORAGE_KEYS.forEach((key) => localStorage.removeItem(key));
+    return true;
+  } catch {
+    // The current v2 write already succeeded; a blocked legacy cleanup must
+    // not take down the calculator or invalidate the new copy.
+    return false;
+  }
 };
 
-const QUARTERS = ["", "¼", "½", "¾"];
-function fmtUnits(units, spec) {
-  if (spec.unit === "turn") {
-    const q = Math.round(units * 4); // integer quarter-turns
-    const whole = Math.floor(q / 4), frac = QUARTERS[q % 4];
-    const num = whole ? `${whole}${frac}` : frac || "0";
-    return `${num} ${units > 1 ? "turns" : "turn"}`; // "½ turn", "1¼ turns"
+const resetSavedStorage = () => {
+  const options = {
+    defaults: PERSISTENCE_DEFAULTS,
+    presets: PRESET_PROFILES,
+    writerId: `factory-reset-${crypto.randomUUID()}`,
+    now: Date.now(),
+  };
+  const restored = loadPersistedPayload(localStorage, options);
+  const current = restored.payload ?? createVersionedPayload(PERSISTENCE_DEFAULTS, options);
+  const reset = commitFactoryReset(current, options);
+  try {
+    // Notify other open tabs before immediately replacing the key with the
+    // authoritative reset generation.
+    localStorage.removeItem(STORAGE_KEY);
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error : new Error("Saved data could not be removed."),
+    };
   }
-  if (spec.unit === "mm") return `${fmt(units, 1)} mm`;
-  return `${units} ${units === 1 ? "click" : "clicks"}`;
-}
-
-/* ---------- small building blocks ---------- */
-
-function Chip({ active, onClick, children, title }) {
-  return (
-    <button
-      onClick={onClick}
-      title={title}
-      style={{
-        fontFamily: FONT_MONO,
-        fontSize: 13,
-        fontWeight: 600,
-        padding: "10px 12px",
-        minHeight: 44,
-        border: `2px solid ${C.ink}`,
-        background: active ? C.ink : C.card,
-        color: active ? C.paper : C.ink,
-        borderRadius: 3,
-        cursor: "pointer",
-        whiteSpace: "nowrap",
-      }}
-    >
-      {children}
-    </button>
-  );
-}
-
-function Label({ children }) {
-  return (
-    <div
-      style={{
-        fontFamily: FONT_HEAD,
-        fontWeight: 700,
-        fontSize: 13,
-        letterSpacing: "0.14em",
-        textTransform: "uppercase",
-        color: C.inkSoft,
-        margin: "14px 0 6px",
-      }}
-    >
-      {children}
-    </div>
-  );
-}
-
-function Card({ children, style }) {
-  return (
-    <div
-      style={{
-        background: C.card,
-        border: `2px solid ${C.ink}`,
-        borderRadius: 4,
-        boxShadow: `3px 3px 0 ${C.grid}`,
-        padding: 14,
-        ...style,
-      }}
-    >
-      {children}
-    </div>
-  );
-}
-
-/* circular-arrow glyph; drawn clockwise, mirrored for counter-clockwise */
-function RotGlyph({ ccw, size = 30, style }) {
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 32 32"
-      aria-hidden="true"
-      style={{ flexShrink: 0, transform: ccw ? "scaleX(-1)" : undefined, ...style }}
-    >
-      <path
-        d="M 23.8 7.3 A 11 11 0 1 0 27 16"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="3.2"
-        strokeLinecap="round"
-      />
-      <path
-        d="M 19.6 2.6 L 25.4 8.6 L 17.8 10.4"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="3.2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
-}
-
-/* ---------- the splatter target ---------- */
-
-const TARGET_SVG_STYLE = {
-  width: "100%",
-  display: "block",
-  touchAction: "manipulation",
-  cursor: "crosshair",
-  background: C.paper,
-  border: `2px solid ${C.ink}`,
-  borderRadius: 4,
-  boxShadow: `3px 3px 0 ${C.grid}`,
-  marginTop: 12,
+  const saved = savePersistedPayload(localStorage, reset);
+  if (saved.ok) removeLegacyCopies();
+  return saved;
 };
 
-const Target = memo(function Target({ span, gridStep, lin, shots, ghosts = [], center, predicted, onTap }) {
-  const S = 340;
-  const px = (u) => S / 2 + (u * S) / span;
-  const py = (u) => S / 2 - (u * S) / span;
-  const pxPer = S / span;
-
-  const gridLines = [];
-  for (let u = gridStep; u <= span / 2; u += gridStep) {
-    gridLines.push(u, -u);
+// IndexedDB read/write transactions with an overlapping object-store scope are
+// serialized across tabs. This supplies the same origin-wide critical section
+// on browsers that do not expose the Web Locks API.
+const runWithIndexedDbLock = (operation) => new Promise((resolve, reject) => {
+  if (!("indexedDB" in window)) {
+    reject(new Error("This browser has no cross-tab locking API."));
+    return;
   }
+  let settled = false;
 
-  const faceR = S * 0.46;
-  const ringFracs = [0.78, 0.56, 0.34];
-
-  const handle = (e) => {
-    e.preventDefault();
-    const r = e.currentTarget.getBoundingClientRect();
-    const fx = (e.clientX - r.left) / r.width;
-    const fy = (e.clientY - r.top) / r.height;
-    onTap({ x: (fx - 0.5) * span, y: (0.5 - fy) * span });
+  const fail = (error) => {
+    if (settled) return;
+    settled = true;
+    reject(error instanceof Error ? error : new Error("Cross-tab coordination failed."));
   };
 
-  const holeR = Math.max(4, pxPer * 0.16);
-  const splatR = holeR * 2.1;
+  const openDatabase = (version) => {
+    let abandoned = false;
+    let openRequest;
+    try {
+      openRequest = version === undefined
+        ? indexedDB.open(COORDINATION_DB)
+        : indexedDB.open(COORDINATION_DB, version);
+    } catch (error) {
+      fail(error);
+      return;
+    }
 
-  return (
-    <svg
-      viewBox={`0 0 ${S} ${S}`}
-      onPointerDown={handle}
-      style={TARGET_SVG_STYLE}
-      role="img"
-      aria-label="Tap target where your shots landed"
-    >
-      {/* graph-paper grid */}
-      <line x1={0} y1={S / 2} x2={S} y2={S / 2} stroke={C.grid} strokeWidth={1.4} />
-      <line x1={S / 2} y1={0} x2={S / 2} y2={S} stroke={C.grid} strokeWidth={1.4} />
-      {gridLines.map((u, i) => (
-        <g key={i}>
-          <line x1={px(u)} y1={0} x2={px(u)} y2={S} stroke={C.grid} strokeWidth={0.7} />
-          <line x1={0} y1={py(u)} x2={S} y2={py(u)} stroke={C.grid} strokeWidth={0.7} />
-        </g>
-      ))}
+    openRequest.onupgradeneeded = () => {
+      try {
+        const database = openRequest.result;
+        if (!database.objectStoreNames.contains(COORDINATION_STORE)) {
+          database.createObjectStore(COORDINATION_STORE);
+        }
+      } catch (error) {
+        openRequest.transaction?.abort();
+        fail(error);
+      }
+    };
+    openRequest.onerror = () => fail(openRequest.error ?? new Error("Could not open the coordination database."));
+    openRequest.onblocked = () => {
+      abandoned = true;
+      fail(new Error("The coordination database is blocked by another tab."));
+    };
+    openRequest.onsuccess = () => {
+      const database = openRequest.result;
+      if (abandoned || settled) {
+        database.close();
+        return;
+      }
+      database.onversionchange = () => database.close();
 
-      {/* black target face */}
-      <circle cx={S / 2} cy={S / 2} r={faceR} fill={C.face} />
-      {ringFracs.map((f, i) => (
-        <circle key={i} cx={S / 2} cy={S / 2} r={faceR * f} fill="none" stroke={C.faceRing} strokeWidth={1.6} />
-      ))}
-      {/* grid ghosted over the face */}
-      {gridLines.map((u, i) => (
-        <g key={`f${i}`} opacity={0.18}>
-          <line x1={px(u)} y1={0} x2={px(u)} y2={S} stroke={C.grid} strokeWidth={0.7} />
-          <line x1={0} y1={py(u)} x2={S} y2={py(u)} stroke={C.grid} strokeWidth={0.7} />
-        </g>
-      ))}
+      // Repair databases created by an older or interrupted build without the
+      // coordination store. Opening at the next version makes the repair work
+      // regardless of the malformed database's current version.
+      if (!database.objectStoreNames.contains(COORDINATION_STORE)) {
+        const repairVersion = database.version + 1;
+        database.close();
+        openDatabase(repairVersion);
+        return;
+      }
 
-      {/* point of aim: red diamond */}
-      <g transform={`rotate(45 ${S / 2} ${S / 2})`}>
-        <rect x={S / 2 - 9} y={S / 2 - 9} width={18} height={18} fill={C.red} />
-      </g>
-      <circle cx={S / 2} cy={S / 2} r={2.4} fill={C.paper} />
+      let result;
+      let operationError = null;
+      let transaction;
+      try {
+        transaction = database.transaction(COORDINATION_STORE, "readwrite");
+        const claim = transaction.objectStore(COORDINATION_STORE).put(Date.now(), "persistence");
+        claim.onsuccess = () => {
+          try {
+            result = operation();
+          } catch (error) {
+            operationError = error;
+            transaction.abort();
+          }
+        };
+      } catch (error) {
+        database.close();
+        fail(error);
+        return;
+      }
+      transaction.oncomplete = () => {
+        database.close();
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
+      transaction.onabort = () => {
+        database.close();
+        fail(operationError
+          ? new LockedOperationError(operationError)
+          : transaction.error ?? new Error("The coordination transaction was aborted."));
+      };
+      transaction.onerror = () => {
+        // The abort handler reports the final transaction error once.
+      };
+    };
+  };
 
-      {/* ghosts: already-dialed shots from the walk-in */}
-      {ghosts.map((s, i) => (
-        <circle key={`g${i}`} cx={px(s.x)} cy={py(s.y)} r={holeR} fill={C.ink} stroke={C.paper} strokeWidth={1.5} opacity={0.4} />
-      ))}
-
-      {/* shots: splatter ring + bullet hole */}
-      {shots.map((s, i) => (
-        <g key={i}>
-          <circle cx={px(s.x)} cy={py(s.y)} r={splatR} fill="none" stroke={C.splat} strokeWidth={holeR * 0.95} opacity={0.95} />
-          <circle cx={px(s.x)} cy={py(s.y)} r={holeR} fill={C.ink} stroke={C.splat} strokeWidth={1.5} />
-        </g>
-      ))}
-
-      {/* group center */}
-      {center && shots.length > 1 && (
-        <g stroke={C.orange} strokeWidth={2.4} fill="none">
-          <line x1={px(center.x) - 12} y1={py(center.y)} x2={px(center.x) + 12} y2={py(center.y)} />
-          <line x1={px(center.x)} y1={py(center.y) - 12} x2={px(center.x)} y2={py(center.y) + 12} />
-          <circle cx={px(center.x)} cy={py(center.y)} r={7} />
-        </g>
-      )}
-
-      {/* predicted POI after dialing */}
-      {predicted && (
-        <g>
-          <circle cx={px(predicted.x)} cy={py(predicted.y)} r={11} fill="none" stroke={C.white} strokeWidth={2} strokeDasharray="4 3" />
-          <circle cx={px(predicted.x)} cy={py(predicted.y)} r={2} fill={C.white} />
-        </g>
-      )}
-
-      {/* scale stamp */}
-      <text x={8} y={S - 8} fontFamily={FONT_MONO} fontSize={10.5} fill={C.inkSoft}>
-        1 square = {gridStep} {lin}
-      </text>
-    </svg>
-  );
+  openDatabase();
 });
-
-/* ---------- results ticket ---------- */
-
-function AdjustRow({ axis, result, type, rot, lin }) {
-  const arrows = { UP: "↑", DOWN: "↓", LEFT: "←", RIGHT: "→" };
-  const { dir, steps, units, spec, residual } = result;
-  const turn = turnFor(rot, dir);
-  const irons = type === "irons";
-  return (
-    <div style={{ padding: "10px 0", borderBottom: `1px dashed ${C.grid}` }}>
-      <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
-        <span style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 14, letterSpacing: "0.12em", color: C.inkSoft, width: 86 }}>
-          {axis}
-        </span>
-        {steps === 0 ? (
-          <span style={{ fontFamily: FONT_MONO, fontWeight: 600, fontSize: 18, color: C.ink }}>HOLD — no change</span>
-        ) : (
-          <span style={{ fontFamily: FONT_MONO, fontWeight: 600, fontSize: 26, color: C.ink }}>
-            {fmtUnits(units, spec)}{" "}
-            <span style={{ color: C.red }}>
-              {dir} {arrows[dir]}
-            </span>
-          </span>
-        )}
-      </div>
-      {steps > 0 && (
-        <div style={{ marginTop: 6, paddingLeft: 86 }}>
-          <div
-            style={{
-              display: "inline-flex", alignItems: "center", gap: 8,
-              border: `2px solid ${C.ink}`, borderRadius: 4,
-              background: C.card, padding: "5px 12px 5px 9px", color: C.ink,
-            }}
-          >
-            {irons ? (
-              <span style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 17, letterSpacing: "0.06em" }}>
-                {IRONS_ACTIONS[dir].main}
-              </span>
-            ) : turn ? (
-              <>
-                <RotGlyph ccw={turn === CCW} />
-                <span style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 19, letterSpacing: "0.06em" }}>
-                  TURN {turn === CW ? "CLOCKWISE" : "COUNTER-CLOCKWISE"}
-                </span>
-              </>
-            ) : (
-              <span style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 17, letterSpacing: "0.06em" }}>
-                TURN TOWARD THE “{dir}” ARROW
-              </span>
-            )}
-          </div>
-          {irons && (
-            <div style={{ fontFamily: FONT_MONO, fontSize: 11.5, color: C.inkSoft, marginTop: 4 }}>
-              {IRONS_ACTIONS[dir].note}
-            </div>
-          )}
-          {residual > 0.05 && (
-            <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.inkSoft, marginTop: 4 }}>
-              ~{fmt(residual, 1)} {lin} will remain
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
 
 /* ============================================================ */
 
 class ErrorBoundary extends React.Component {
   constructor(props) {
     super(props);
-    this.state = { hasError: false };
+    this.state = { hasError: false, resetError: "" };
+    this.headingRef = React.createRef();
   }
   static getDerivedStateFromError() {
     return { hasError: true };
   }
+  componentDidMount() {
+    if (this.state.hasError) this.headingRef.current?.focus();
+  }
+  componentDidUpdate(previousProps, previousState) {
+    if (this.state.hasError && !previousState.hasError) this.headingRef.current?.focus();
+  }
   render() {
     if (this.state.hasError) {
       return (
-        <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: C.paper, fontFamily: FONT_MONO, padding: 20, textAlign: "center" }}>
-          <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 12 }}>Something went wrong.</div>
-          <button
-            onClick={() => { localStorage.removeItem("clickbait-v1"); window.location.reload(); }}
-            style={{ fontFamily: FONT_MONO, fontSize: 14, padding: "12px 20px", border: `2px solid ${C.ink}`, borderRadius: 4, background: C.red, color: C.white, cursor: "pointer" }}
-          >
-            Reset app and reload
-          </button>
-        </div>
+        <main
+          aria-labelledby="fatal-error-title"
+          aria-live="assertive"
+          aria-atomic="true"
+          style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: C.paper, color: C.ink, fontFamily: FONT_MONO, padding: 20, textAlign: "center" }}
+        >
+          <h1 id="fatal-error-title" ref={this.headingRef} tabIndex={-1} style={{ fontFamily: FONT_HEAD, fontSize: 28, margin: "0 0 8px" }}>
+            Clickbait hit an unexpected error
+          </h1>
+          <p style={{ maxWidth: 520, margin: "0 0 16px", lineHeight: 1.6 }}>
+            Reload first; your saved optics and dope log will be kept. Only reset saved data if the error returns.
+          </p>
+          {this.state.resetError && (
+            <p role="alert" style={{ maxWidth: 520, margin: "0 0 16px", color: C.red, fontWeight: 600 }}>
+              {this.state.resetError}
+            </p>
+          )}
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "center" }}>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              style={{ minHeight: 44, fontFamily: FONT_MONO, fontSize: 16, padding: "12px 20px", border: `2px solid ${C.ink}`, borderRadius: 4, background: C.ink, color: C.paper, cursor: "pointer" }}
+            >
+              Reload app
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (!window.confirm("Delete all saved optics and dope-log entries? This cannot be undone.")) return;
+                const reset = resetSavedStorage();
+                if (!reset.ok) {
+                  this.setState({
+                    resetError: `Saved data could not be reset: ${reset.error.message}`,
+                  });
+                  return;
+                }
+                window.location.reload();
+              }}
+              style={{ minHeight: 44, fontFamily: FONT_MONO, fontSize: 16, padding: "12px 20px", border: `2px solid ${C.red}`, borderRadius: 4, background: C.card, color: C.red, cursor: "pointer" }}
+            >
+              Reset saved data
+            </button>
+          </div>
+        </main>
       );
     }
     return this.props.children;
@@ -438,17 +350,599 @@ function AppInner() {
   const [numH, setNumH] = useState({ dir: "LEFT", val: "" });
   const [log, setLog] = useState([]);
   const [editing, setEditing] = useState(false);
-  const [counter, setCounter] = useState({ turret: "ELEVATION", count: 0, done: false });
+  const [editorSession, setEditorSession] = useState(0);
+  const [counterSessions, setCounterSessions] = useState({});
+  const [counterTurret, setCounterTurret] = useState("ELEVATION");
+  const [statusMessage, setStatusMessage] = useState("");
+  const [persistenceWarning, setPersistenceWarning] = useState("");
+  const [clearLogPending, setClearLogPending] = useState(false);
+  const [deleteCandidateId, setDeleteCandidateId] = useState(null);
+  const [zeroSession, setZeroSession] = useState(0);
+  const [centerSession, setCenterSession] = useState(0);
   const saveTimer = useRef(null);
   const loadedRef = useRef(false);
+  const writerIdRef = useRef("");
+  const persistenceEnvelopeRef = useRef(null);
+  const persistenceDisabledRef = useRef(false);
+  const primaryStorageExpectedRef = useRef(false);
+  const pendingPatchRef = useRef({});
+  const pendingPatchUnitsRef = useRef(null);
+  const targetRef = useRef(null);
+  const manualVerticalRef = useRef(null);
+  const opticSelectorRef = useRef(null);
+  const logHeadingRef = useRef(null);
+  const deleteRequestRef = useRef(null);
+  const deleteConfirmRef = useRef(null);
+  const clearLogRequestRef = useRef(null);
+  const clearLogConfirmRef = useRef(null);
+  const tabRefs = useRef({});
+  const reconciliationFocusRef = useRef(null);
+
+  // Storage events often arrive while this page is a background mobile tab,
+  // where requestAnimationFrame can be suspended. Resolve focus after React
+  // has committed the reconciled DOM instead of relying on a frame callback.
+  useEffect(() => {
+    const request = reconciliationFocusRef.current;
+    if (!request) return;
+    let target = null;
+    if (request.type === "entry") {
+      target = request.entryMode === "tap" ? targetRef.current : manualVerticalRef.current;
+    } else if (request.type === "optic") {
+      target = Array.from(opticSelectorRef.current?.querySelectorAll("[data-optic-id]") ?? [])
+        .find((candidate) => candidate.dataset.opticId === request.activeId) ?? null;
+    } else if (request.type === "center") {
+      target = document.getElementById("panel-center");
+    } else if (request.type === "delete") {
+      target = deleteRequestRef.current;
+    } else if (request.type === "log") {
+      target = logHeadingRef.current;
+    }
+    if (!target) return;
+    reconciliationFocusRef.current = null;
+    target.focus();
+  }, [
+    activeId,
+    clearLogPending,
+    deleteCandidateId,
+    distance,
+    editing,
+    entryMode,
+    log,
+    mode,
+    profiles,
+    shots,
+    span,
+    tab,
+    units,
+    zeroSession,
+    centerSession,
+  ]);
+
+  const clearTransientEntry = useCallback(() => {
+    setShots([]);
+    setGhosts([]);
+    setNumV({ dir: "LOW", val: "" });
+    setNumH({ dir: "LEFT", val: "" });
+  }, []);
+
+  const applyPersistedData = useCallback((data) => {
+    setProfiles(data.profiles);
+    setActiveId(data.activeId);
+    setUnits(data.units);
+    setDistance(data.distance);
+    setSpan(data.span);
+    setLog(data.log);
+    setMode(data.mode);
+    setEntryMode(data.entryMode);
+    setCounterSessions(data.counters);
+  }, []);
+
+  const applyFactoryResetUi = useCallback((data) => {
+    applyPersistedData(data);
+    clearTransientEntry();
+    setEditing(false);
+    setEditorSession((session) => session + 1);
+    setDeleteCandidateId(null);
+    setClearLogPending(false);
+    setCounterTurret("ELEVATION");
+    setZeroSession((session) => session + 1);
+    setCenterSession((session) => session + 1);
+  }, [applyPersistedData, clearTransientEntry]);
+
+  const persistenceOptions = useCallback((now = Date.now()) => ({
+    defaults: PERSISTENCE_DEFAULTS,
+    presets: PRESET_PROFILES,
+    writerId: writerIdRef.current || "clickbait-tab",
+    now,
+  }), []);
+
+  const saveEnvelope = useCallback((envelope, { silent = false } = {}) => {
+    if (persistenceDisabledRef.current) {
+      setPersistenceWarning("Saved data is unavailable or belongs to a newer app version. Changes on this screen are not being saved.");
+      if (!silent) setStatusMessage("Changes are temporary because saved data is unavailable or from a newer app version.");
+      return false;
+    }
+    const saved = savePersistedPayload(localStorage, envelope);
+    if (!saved.ok) {
+      const warning = `Could not save range data: ${saved.error.message} Changes on this screen are not being saved.`;
+      setPersistenceWarning(warning);
+      if (!silent) setStatusMessage(`${warning} Your current screen remains usable.`);
+    } else {
+      primaryStorageExpectedRef.current = true;
+      setPersistenceWarning("");
+    }
+    return saved.ok;
+  }, []);
+
+  const readLatestBeforeWrite = useCallback(({ silent = false } = {}) => {
+    const current = persistenceEnvelopeRef.current;
+    if (!current) return { payload: null, canWrite: false, notice: "" };
+    const latest = loadPersistedPayload(localStorage, persistenceOptions());
+    if (!latest.canSave || !latest.payload) {
+      persistenceDisabledRef.current = true;
+      const issue = latest.issues[0]?.message ?? "Saved data could not be read safely.";
+      setPersistenceWarning(`${issue} Changes on this screen are not being saved.`);
+      if (!silent) setStatusMessage(`${issue} This change remains available only on the current screen.`);
+      return { payload: current, canWrite: false, notice: "" };
+    }
+
+    // The tab that calls localStorage.clear()/removeItem() receives no storage
+    // event. Once this session has successfully persisted data, a missing
+    // primary key therefore means an explicit reset, not a blank initial load.
+    let primaryKeyMissing = false;
+    try {
+      primaryKeyMissing = primaryStorageExpectedRef.current
+        && localStorage.getItem(STORAGE_KEY) === null;
+    } catch {
+      // loadPersistedPayload already reports inaccessible storage above.
+    }
+    if (primaryKeyMissing) {
+      const reset = commitFactoryReset(current, persistenceOptions());
+      persistenceEnvelopeRef.current = reset;
+      persistenceDisabledRef.current = false;
+      reconciliationFocusRef.current = { type: "optic", activeId: reset.data.activeId };
+      applyFactoryResetUi(reset.data);
+      const saved = saveEnvelope(reset, { silent });
+      return {
+        payload: reset,
+        canWrite: saved,
+        notice: "Saved range data was reset before this change was applied.",
+        factoryReset: true,
+      };
+    }
+
+    persistenceDisabledRef.current = false;
+    const merged = mergePersistedPayloads(current, latest.payload, {
+      defaults: PERSISTENCE_DEFAULTS,
+      presets: PRESET_PROFILES,
+    });
+    persistenceEnvelopeRef.current = merged;
+    const notice = latest.status === "recovered"
+      ? (latest.issues[0]?.message ?? "Invalid saved fields were restored safely.")
+      : latest.status === "migrated"
+        ? "Legacy saved data was merged and upgraded."
+        : "";
+    return { payload: merged, canWrite: true, notice };
+  }, [applyFactoryResetUi, persistenceOptions, saveEnvelope]);
+
+  const commitPatchNow = useCallback((patch, { successMessage = "", silent = false } = {}) => {
+    const current = persistenceEnvelopeRef.current;
+    if (!current) return { payload: null, saved: false };
+    clearTimeout(saveTimer.current);
+    let pendingPatch = { ...pendingPatchRef.current };
+    let pendingUnits = pendingPatchUnitsRef.current;
+    pendingPatchRef.current = {};
+    pendingPatchUnitsRef.current = null;
+    const latest = readLatestBeforeWrite({ silent });
+    const base = latest.payload ?? current;
+    // A factory reset is authoritative over drafts queued before the key was
+    // removed. Preserve only the explicit edit that triggered this write.
+    if (latest.factoryReset) {
+      pendingPatch = {};
+      pendingUnits = null;
+    }
+    const contextChanged = pendingUnits && base.data.units !== pendingUnits;
+    if (contextChanged) {
+      delete pendingPatch.distance;
+      delete pendingPatch.span;
+    }
+    const combinedPatch = { ...pendingPatch, ...patch };
+    if (Object.keys(combinedPatch).length === 0) {
+      persistenceEnvelopeRef.current = base;
+      applyPersistedData(base.data);
+      if (contextChanged && !silent) {
+        setStatusMessage("A pending distance or target-width edit was discarded because another tab changed the unit system.");
+      } else if (latest.notice && !silent) {
+        setStatusMessage(latest.notice);
+      }
+      return { payload: base, saved: false };
+    }
+    const next = commitPersistedPatch(base, combinedPatch, persistenceOptions());
+    persistenceEnvelopeRef.current = next;
+    applyPersistedData(next.data);
+    if (!latest.canWrite) return { payload: next, saved: false };
+    const saved = saveEnvelope(next, { silent });
+    const contextNotice = contextChanged
+      ? "A pending distance or target-width edit was discarded because another tab changed the unit system."
+      : "";
+    const completedMessage = [successMessage, latest.notice, contextNotice].filter(Boolean).join(" ");
+    if (saved && completedMessage) setStatusMessage(completedMessage);
+    return { payload: next, saved };
+  }, [applyPersistedData, persistenceOptions, readLatestBeforeWrite, saveEnvelope]);
+
+  const flushPending = useCallback(({ silent = false } = {}) => {
+    const current = persistenceEnvelopeRef.current;
+    if (!current || !loadedRef.current) return current;
+    if (Object.keys(pendingPatchRef.current).length === 0) return current;
+    return commitPatchNow({}, { silent }).payload;
+  }, [commitPatchNow]);
+
+  const commitAtomicNow = useCallback((operation, { successMessage = "", silent = false } = {}) => {
+    const current = flushPending({ silent: true }) ?? persistenceEnvelopeRef.current;
+    if (!current) return { payload: null, saved: false };
+    const latest = readLatestBeforeWrite({ silent });
+    const base = latest.payload ?? current;
+    let next;
+    try {
+      next = operation(base, persistenceOptions());
+    } catch (error) {
+      if (!silent) {
+        const detail = error instanceof Error ? error.message : "The requested change was invalid.";
+        setStatusMessage(`Could not update saved range data: ${detail}`);
+      }
+      return { payload: base, saved: false };
+    }
+    if (next === base) {
+      persistenceEnvelopeRef.current = base;
+      applyPersistedData(base.data);
+      return { payload: base, saved: false };
+    }
+    persistenceEnvelopeRef.current = next;
+    applyPersistedData(next.data);
+    if (!latest.canWrite) return { payload: next, saved: false };
+    const saved = saveEnvelope(next, { silent });
+    const completedMessage = [successMessage, latest.notice].filter(Boolean).join(" ");
+    if (saved && completedMessage) setStatusMessage(completedMessage);
+    return { payload: next, saved };
+  }, [applyPersistedData, flushPending, persistenceOptions, readLatestBeforeWrite, saveEnvelope]);
+
+  const runWithPersistenceLock = useCallback((operation, onComplete) => {
+    const execute = () => {
+      const result = operation();
+      onComplete?.(result);
+      return result;
+    };
+    if (navigator.locks?.request) {
+      void navigator.locks
+        .request("clickbait-persistence", { mode: "exclusive" }, execute)
+        .catch((error) => {
+          const detail = error instanceof Error ? error.message : "Cross-tab coordination was unavailable.";
+          setStatusMessage(`Could not coordinate the saved-data update: ${detail}`);
+        });
+      return null;
+    }
+    void runWithIndexedDbLock(execute).catch((error) => {
+      if (error instanceof LockedOperationError) {
+        setStatusMessage(`Could not complete the saved-data update: ${error.message}`);
+        return;
+      }
+      const detail = error instanceof Error ? error.message : "Cross-tab coordination was unavailable.";
+      setStatusMessage(`Cross-tab coordination is unavailable; applying this update locally. ${detail}`);
+      execute();
+    });
+    return null;
+  }, []);
+
+  const runAtomicTransaction = useCallback((operation, options = {}, onComplete) => (
+    runWithPersistenceLock(
+      () => commitAtomicNow(operation, options),
+      onComplete,
+    )
+  ), [commitAtomicNow, runWithPersistenceLock]);
+
+  const runPatchTransaction = useCallback((patch, options = {}, onComplete) => (
+    runWithPersistenceLock(
+      () => commitPatchNow(patch, options),
+      onComplete,
+    )
+  ), [commitPatchNow, runWithPersistenceLock]);
+
+  const queuePersistedEdit = useCallback((patch) => {
+    if (Object.prototype.hasOwnProperty.call(patch, "distance")) setDistance(patch.distance);
+    if (Object.prototype.hasOwnProperty.call(patch, "span")) setSpan(patch.span);
+    let primaryKeyMissing = false;
+    try {
+      primaryKeyMissing = primaryStorageExpectedRef.current
+        && localStorage.getItem(STORAGE_KEY) === null;
+    } catch {
+      // The normal write path will surface inaccessible storage.
+    }
+    if (primaryKeyMissing) {
+      // This edit happened after the reset, so make it the explicit trigger
+      // rather than putting it in the pre-reset draft bucket. Preserve the
+      // unit context visible to the user and reset the companion measurement
+      // to that unit system's default.
+      runPatchTransaction({
+        units,
+        distance: Object.prototype.hasOwnProperty.call(patch, "distance")
+          ? patch.distance
+          : UNITS[units].distances[2],
+        span: Object.prototype.hasOwnProperty.call(patch, "span")
+          ? patch.span
+          : UNITS[units].spans[1],
+      });
+      return;
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(patch, "distance")
+      || Object.prototype.hasOwnProperty.call(patch, "span")
+    ) {
+      pendingPatchUnitsRef.current = units;
+    }
+    pendingPatchRef.current = { ...pendingPatchRef.current, ...patch };
+    clearTimeout(saveTimer.current);
+    saveTimer.current = window.setTimeout(() => {
+      runWithPersistenceLock(() => flushPending());
+    }, 400);
+  }, [flushPending, runPatchTransaction, runWithPersistenceLock, units]);
+
+  /* ----- persistence ----- */
+  /* eslint-disable react-hooks/set-state-in-effect -- localStorage is client-only; the loading gate keeps this hydration pass from flashing default data. */
+  useEffect(() => {
+    writerIdRef.current = crypto.randomUUID();
+    const options = persistenceOptions();
+    const restored = loadPersistedPayload(localStorage, options);
+    const envelope = restored.payload ?? createVersionedPayload(PERSISTENCE_DEFAULTS, options);
+    persistenceEnvelopeRef.current = envelope;
+    persistenceDisabledRef.current = !restored.canSave;
+    try {
+      primaryStorageExpectedRef.current = localStorage.getItem(STORAGE_KEY) !== null;
+    } catch {
+      primaryStorageExpectedRef.current = false;
+    }
+    if (!restored.canSave) {
+      const issue = restored.issues[0]?.message ?? "Saved data is unavailable.";
+      setPersistenceWarning(`${issue} Changes on this screen are not being saved.`);
+    }
+    applyPersistedData(envelope.data);
+
+    if (restored.status === "migrated" && restored.canSave) {
+      const saved = savePersistedPayload(localStorage, envelope);
+      if (saved.ok) {
+        primaryStorageExpectedRef.current = true;
+        removeLegacyCopies();
+        const recoveredFields = restored.issues.some((issue) => issue.code !== "migrated");
+        setStatusMessage(recoveredFields
+          ? "Saved range data was upgraded; invalid legacy fields were restored safely."
+          : "Saved range data was upgraded to the current format.");
+      } else {
+        setPersistenceWarning(`Could not save upgraded range data: ${saved.error.message}`);
+        setStatusMessage(`Saved data was upgraded in memory but could not be written: ${saved.error.message}`);
+      }
+    } else if (restored.status === "unsupported-version") {
+      setStatusMessage(restored.issues[0]?.message ?? "Saved data is from a newer app version; changes will be temporary.");
+    } else if (restored.status === "recovered") {
+      const detail = restored.issues[0]?.message ?? "Some saved data was invalid and safe values were restored.";
+      setStatusMessage(restored.canSave ? detail : `${detail} Changes will remain temporary.`);
+    }
+
+    loadedRef.current = true;
+    setLoaded(true);
+  }, [applyPersistedData, persistenceOptions]);
+  /* eslint-enable react-hooks/set-state-in-effect */
+
+  useEffect(() => {
+    const handlePageHide = () => flushPending({ silent: true });
+    const handleVisibility = () => {
+      if (document.visibilityState === "hidden") flushPending();
+    };
+    window.addEventListener("pagehide", handlePageHide);
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      window.removeEventListener("pagehide", handlePageHide);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      clearTimeout(saveTimer.current);
+    };
+  }, [flushPending]);
+
+  useEffect(() => {
+    if (!loaded) return undefined;
+    const handleStorage = (event) => {
+      const clearedAllStorage = event.key === null && event.newValue == null;
+      if (!clearedAllStorage && ![STORAGE_KEY, ...LEGACY_STORAGE_KEYS].includes(event.key)) return;
+      // Removing the primary key is an explicit reset. Turn it into a versioned
+      // reset commit so stale tabs cannot later resurrect deleted profiles/logs.
+      // Legacy-key cleanup, by contrast, must remain a no-op.
+      if (event.newValue == null) {
+        if (event.key !== STORAGE_KEY && !clearedAllStorage) return;
+        const current = persistenceEnvelopeRef.current;
+        if (!current) return;
+        clearTimeout(saveTimer.current);
+        pendingPatchRef.current = {};
+        pendingPatchUnitsRef.current = null;
+        const reset = commitFactoryReset(current, persistenceOptions());
+        persistenceEnvelopeRef.current = reset;
+        persistenceDisabledRef.current = false;
+        applyFactoryResetUi(reset.data);
+        reconciliationFocusRef.current = { type: "optic", activeId: reset.data.activeId };
+        const saved = saveEnvelope(reset);
+        setStatusMessage(saved
+          ? "Saved range data was reset in another tab. Defaults were restored here too."
+          : "Saved range data was reset in another tab, but the reset could not be written from this tab.");
+        return;
+      }
+      const incoming = parsePersistedPayload(event.newValue, persistenceOptions());
+      if (!incoming.payload) {
+        persistenceDisabledRef.current = true;
+        const warning = incoming.issues[0]?.message ?? "Another tab saved data from a newer app version; local saving is paused.";
+        setPersistenceWarning(`${warning} Changes on this screen are not being saved.`);
+        setStatusMessage(warning);
+        return;
+      }
+      const persistedBeforeFlush = persistenceEnvelopeRef.current?.data;
+      // React state already includes debounced distance/span drafts. Compare
+      // reconciliation against that effective calculation context so flushing
+      // our own draft cannot masquerade as a change from another tab.
+      const previousDataBeforeFlush = persistedBeforeFlush ? {
+        ...persistedBeforeFlush,
+        profiles,
+        activeId,
+        units,
+        distance,
+        span,
+        log,
+        mode,
+        entryMode,
+        counters: counterSessions,
+      } : null;
+      const entryControlHadFocus = document.activeElement === targetRef.current
+        || document.activeElement === manualVerticalRef.current
+        || ["vertical-offset", "horizontal-offset"].includes(document.activeElement?.id);
+      const transientEntryActionHadFocus = entryControlHadFocus
+        || document.activeElement?.id === "stamp-adjustment";
+      const logActionHadFocus = document.activeElement === clearLogRequestRef.current
+        || document.getElementById("panel-log")
+          ?.querySelector('[aria-label="Confirm clearing the dope log"]')
+          ?.contains(document.activeElement);
+      const opticSelectorHadFocus = opticSelectorRef.current?.contains(document.activeElement);
+      const centerPanelHadFocus = document.getElementById("panel-center")?.contains(document.activeElement);
+      const centerResetConfirmationHadFocus = document.getElementById("panel-center")
+        ?.querySelector('[aria-label^="Confirm resetting the "]')
+        ?.contains(document.activeElement);
+      const deleteConfirmationHadFocus = document.activeElement === deleteConfirmRef.current
+        || document.getElementById("optic-spec-editor")
+          ?.querySelector('[aria-label^="Confirm deletion of"]')
+          ?.contains(document.activeElement);
+      const editorHadFocus = document
+        .getElementById("optic-spec-editor")
+        ?.contains(document.activeElement);
+      const local = flushPending({ silent: true }) ?? persistenceEnvelopeRef.current;
+      if (!local) return;
+      const merged = mergePersistedPayloads(local, incoming.payload, {
+        defaults: PERSISTENCE_DEFAULTS,
+        presets: PRESET_PROFILES,
+      });
+      persistenceEnvelopeRef.current = merged;
+      const latest = readLatestBeforeWrite();
+      const reconciled = latest.payload ?? merged;
+      const previousData = previousDataBeforeFlush ?? local.data;
+      const nextData = reconciled.data;
+      const previousProfile = previousData.profiles.find((profile) => profile.id === previousData.activeId);
+      const nextProfile = nextData.profiles.find((profile) => profile.id === nextData.activeId);
+      const activeProfileChanged = JSON.stringify(previousProfile) !== JSON.stringify(nextProfile);
+      const calculationProfileChanged = calculationProfileSignature(previousProfile)
+        !== calculationProfileSignature(nextProfile);
+      const calculationContextChanged = calculationProfileChanged
+        || previousData.activeId !== nextData.activeId
+        || previousData.units !== nextData.units
+        || previousData.distance !== nextData.distance
+        || previousData.span !== nextData.span
+        || previousData.mode !== nextData.mode
+        || previousData.entryMode !== nextData.entryMode;
+      applyPersistedData(reconciled.data);
+      if (calculationContextChanged) clearTransientEntry();
+      if (calculationContextChanged && transientEntryActionHadFocus) {
+        reconciliationFocusRef.current = { type: "entry", entryMode: nextData.entryMode };
+      }
+      if (nextData.log.length === 0) {
+        setClearLogPending(false);
+        if (previousData.log.length > 0 && logActionHadFocus) {
+          reconciliationFocusRef.current = { type: "log" };
+        }
+      }
+      if (activeProfileChanged) setDeleteCandidateId(null);
+      if (
+        previousData.activeId !== nextData.activeId
+        || previousProfile?.type !== nextProfile?.type
+      ) {
+        setCounterTurret("ELEVATION");
+        setEditing(false);
+        setDeleteCandidateId(null);
+        setEditorSession((current) => current + 1);
+        if (editorHadFocus || opticSelectorHadFocus) {
+          reconciliationFocusRef.current = { type: "optic", activeId: nextData.activeId };
+        } else if (
+          centerPanelHadFocus
+          && (previousProfile?.type !== nextProfile?.type || centerResetConfirmationHadFocus)
+        ) {
+          reconciliationFocusRef.current = { type: "center" };
+        }
+      } else if (activeProfileChanged && deleteConfirmationHadFocus) {
+        reconciliationFocusRef.current = { type: "delete" };
+      }
+      const saved = latest.canWrite && saveEnvelope(reconciled);
+      if (saved) {
+        if (event.key !== STORAGE_KEY) removeLegacyCopies();
+        const recovered = incoming.status === "recovered" || Boolean(latest.notice);
+        const mergeMessage = recovered
+          ? "Changes from another tab were merged; invalid saved fields were restored safely."
+          : "Changes from another tab were merged.";
+        setStatusMessage(calculationContextChanged
+          ? `${mergeMessage} The in-progress shot entry was cleared because its calculation settings changed.`
+          : mergeMessage);
+      }
+    };
+    window.addEventListener("storage", handleStorage);
+    return () => window.removeEventListener("storage", handleStorage);
+  }, [
+    activeId,
+    applyFactoryResetUi,
+    applyPersistedData,
+    clearTransientEntry,
+    counterSessions,
+    distance,
+    entryMode,
+    flushPending,
+    loaded,
+    log,
+    mode,
+    persistenceOptions,
+    profiles,
+    readLatestBeforeWrite,
+    saveEnvelope,
+    span,
+    units,
+  ]);
+
   const handleTargetTap = useCallback(
-    (pt) => setShots((s) => (mode === "one" ? [pt] : [...s, pt])),
-    [mode]
+    (pt) => {
+      if (mode === "group" && shots.length >= MAX_SHOTS) {
+        setStatusMessage(`Group is limited to ${MAX_SHOTS} marked shots. Undo or clear a shot to continue.`);
+        return;
+      }
+      setShots((current) => (mode === "one" ? [pt] : appendBounded(current, pt, MAX_SHOTS)));
+      const nextShotCount = shots.length + 1;
+      setStatusMessage(mode === "one"
+        ? "Shot marked. Dialing instructions updated."
+        : nextShotCount < 3
+          ? `Shot ${nextShotCount} marked. Mark ${3 - nextShotCount} more before dialing from the group center.`
+          : `Shot ${nextShotCount} marked. Group dialing instructions updated.`);
+    },
+    [mode, shots.length]
   );
+
+  const focusEntryControl = useCallback(() => {
+    requestAnimationFrame(() => {
+      (entryMode === "tap" ? targetRef.current : manualVerticalRef.current)?.focus();
+    });
+  }, [entryMode]);
 
   const switchMode = (m) => {
     if (m === mode) return;
-    setMode(m);
+    runPatchTransaction({ mode: m }, {
+      successMessage: m === "one" ? "One-shot walk-in mode selected." : "Group mode selected.",
+    });
+    setShots([]);
+    setGhosts([]);
+    setNumV({ dir: "LOW", val: "" });
+    setNumH({ dir: "LEFT", val: "" });
+  };
+
+  const switchEntryMode = (nextMode) => {
+    if (nextMode === entryMode) return;
+    runPatchTransaction({ entryMode: nextMode }, {
+      successMessage: nextMode === "tap" ? "Target coordinate entry selected." : "Measured offset entry selected.",
+    });
     setShots([]);
     setGhosts([]);
     setNumV({ dir: "LOW", val: "" });
@@ -457,206 +951,423 @@ function AppInner() {
 
   const switchOptic = (id) => {
     if (id === activeId) return;
-    setActiveId(id);
+    setCounterTurret("ELEVATION");
+    const restoredCounter = getCounterSession(counterSessions, id, "ELEVATION");
+    runPatchTransaction({ activeId: id }, {
+      successMessage: `Optic changed. Saved elevation count restored at ${restoredCounter.count} clicks.`,
+    });
     setShots([]);
     setGhosts([]);
     setNumV({ dir: "LOW", val: "" });
     setNumH({ dir: "LEFT", val: "" });
+    setDeleteCandidateId(null);
   };
 
   const U = UNITS[units];
   const profile = profiles.find((p) => p.id === activeId) || profiles[0];
 
-  /* ----- persistence ----- */
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem("clickbait-v1");
-      if (raw) {
-        const s = JSON.parse(raw);
-        if (s.profiles && s.profiles.length) {
-          // append any presets the saved list doesn't know about yet
-          const saved = s.profiles;
-          setProfiles([...saved, ...PRESET_PROFILES.filter((p) => !saved.some((x) => x.id === p.id))]);
-        }
-        if (s.activeId) setActiveId(s.activeId);
-        if (s.units) setUnits(s.units);
-        if (s.distance) setDistance(s.distance);
-        if (s.span) setSpan(s.span);
-        if (s.log) setLog(s.log);
-        if (s.mode) setMode(s.mode);
-      }
-    } catch (e) {
-      /* first run — nothing saved yet */
-    }
-    loadedRef.current = true;
-    setLoaded(true);
-  }, []);
-
-  useEffect(() => {
-    if (!loadedRef.current) return;
-    clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => {
-      try {
-        localStorage.setItem(
-          "clickbait-v1",
-          JSON.stringify({ profiles, activeId, units, distance, span, log, mode })
-        );
-      } catch (e) {}
-    }, 400);
-    return () => clearTimeout(saveTimer.current);
-  }, [profiles, activeId, units, distance, span, log, mode, loaded]);
-
   /* ----- unit switch keeps things sane ----- */
   const switchUnits = (u) => {
     if (u === units) return;
-    setUnits(u);
-    setDistance(UNITS[u].distances[2] || UNITS[u].distances[0]);
-    setSpan(UNITS[u].spans[1]);
+    const nextDistance = UNITS[u].distances[2] || UNITS[u].distances[0];
+    const nextSpan = UNITS[u].spans[1];
+    runPatchTransaction({ units: u, distance: nextDistance, span: nextSpan }, {
+      successMessage: u === "imp" ? "Imperial units selected." : "Metric units selected.",
+    });
     setShots([]);
     setGhosts([]);
     setNumV({ dir: "LOW", val: "" });
     setNumH({ dir: "LEFT", val: "" });
   };
 
+  const manualValidation = useMemo(() => validateManualOffsets({
+    vertical: { direction: numV.dir, value: numV.val },
+    horizontal: { direction: numH.dir, value: numH.val },
+  }), [numV, numH]);
+  const numVError = manualValidation.errors.find((error) => error.field === "vertical")?.message ?? null;
+  const numHError = manualValidation.errors.find((error) => error.field === "horizontal")?.message ?? null;
+
   /* ----- the math ----- */
+  const markedCenter = useMemo(
+    () => (shots.length ? groupCenter(shots) : null),
+    [shots],
+  );
+  const markedGroupSize = useMemo(
+    () => (shots.length > 1 ? extremeSpread(shots) : null),
+    [shots],
+  );
   const calc = useMemo(() => {
-    let cx = null, cy = null;
-    if (entryMode === "tap" && shots.length) {
-      cx = shots.reduce((a, s) => a + s.x, 0) / shots.length;
-      cy = shots.reduce((a, s) => a + s.y, 0) / shots.length;
-    } else if (entryMode === "type" && (numV.val !== "" || numH.val !== "")) {
-      const v = parseFloat(numV.val) || 0;
-      const h = parseFloat(numH.val) || 0;
-      cy = numV.dir === "LOW" ? -v : v;
-      cx = numH.dir === "LEFT" ? -h : h;
+    let point = null;
+    const tapEntryReady = mode === "one" ? shots.length > 0 : shots.length >= 3;
+    if (entryMode === "tap" && tapEntryReady) {
+      point = markedCenter;
+    } else if (entryMode === "type" && manualValidation.ok) {
+      point = manualValidation.point;
     }
-    if (cx === null) return null;
-
-    const axes = axisSpecs(profile);
-    const solveAxis = (offset, dir, spec) => {
-      const perUnit = spec.moaPerUnit * U.perMOA(distance); // linear units per 1.0 unit
-      if (!perUnit || !isFinite(perUnit)) return null;
-      const steps = Math.round(Math.abs(offset) / (perUnit * spec.step)); // integer count of quanta
-      const units = steps * spec.step;
-      return {
-        dir, steps, units, spec, perUnit,
-        move: units * perUnit, // linear correction applied
-        residual: Math.abs(Math.abs(offset) - units * perUnit),
-        overTravel: units > spec.maxUnits,
-      };
+    if (!point) return null;
+    const adjustment = calculateAdjustment({
+      x: point.x,
+      y: point.y,
+      distance,
+      units,
+      profile,
+    });
+    return {
+      ...adjustment,
+      groupSize: entryMode === "tap" && mode === "group" ? markedGroupSize : null,
     };
-    const elev = solveAxis(cy, cy <= 0 ? "UP" : "DOWN", axes.elev);
-    const wind = solveAxis(cx, cx <= 0 ? "RIGHT" : "LEFT", axes.wind);
-    if (!elev || !wind) return null;
-
-    const predicted = {
-      x: cx + (wind.dir === "RIGHT" ? 1 : -1) * wind.move,
-      y: cy + (elev.dir === "UP" ? 1 : -1) * elev.move,
-    };
-
-    let groupSize = null;
-    if (entryMode === "tap" && shots.length > 1) {
-      let m = 0;
-      for (let i = 0; i < shots.length; i++)
-        for (let j = i + 1; j < shots.length; j++)
-          m = Math.max(m, Math.hypot(shots[i].x - shots[j].x, shots[i].y - shots[j].y));
-      groupSize = m;
-    }
-
-    return { cx, cy, elev, wind, predicted, groupSize };
-  }, [shots, entryMode, numV, numH, profile, distance, units]);
+  }, [shots.length, entryMode, mode, markedCenter, markedGroupSize, manualValidation, profile, distance, units]);
 
   const zeroed = calc && calc.elev.steps === 0 && calc.wind.steps === 0;
 
   const stampLog = () => {
     if (!calc) return;
-    setLog((l) => [
-      {
-        id: crypto.randomUUID(),
-        ts: Date.now(),
-        optic: profile.short,
-        dist: `${distance} ${U.dist}`,
-        e: calc.elev.steps
-          ? `${calc.elev.spec.unit === "click" ? calc.elev.units : fmtUnits(calc.elev.units, calc.elev.spec)}${calc.elev.dir === "UP" ? "↑" : "↓"}`
-          : "—",
-        w: calc.wind.steps
-          ? `${calc.wind.spec.unit === "click" ? calc.wind.units : fmtUnits(calc.wind.units, calc.wind.spec)}${calc.wind.dir === "RIGHT" ? "→" : "←"}`
-          : "—",
-        grp: calc.groupSize ? `${fmt(calc.groupSize, 1)} ${U.lin}` : null,
-        one: mode === "one" || undefined,
-      },
-      ...l,
-    ]);
-    if (mode === "one" && shots.length) setGhosts((g) => [...g, shots[0]]);
+    const entry = {
+      id: crypto.randomUUID(),
+      ts: Date.now(),
+      optic: profile.short,
+      dist: `${distance} ${U.dist}`,
+      e: calc.elev.steps
+        ? `${calc.elev.spec.unit === "click" ? calc.elev.units : fmtUnits(calc.elev.units, calc.elev.spec)}${calc.elev.dir === "UP" ? "↑" : "↓"}`
+        : "—",
+      w: calc.wind.steps
+        ? `${calc.wind.spec.unit === "click" ? calc.wind.units : fmtUnits(calc.wind.units, calc.wind.spec)}${calc.wind.dir === "RIGHT" ? "→" : "←"}`
+        : "—",
+      grp: calc.groupSize ? `${fmt(calc.groupSize, 1)} ${U.lin}` : null,
+      one: mode === "one" || undefined,
+    };
+    runAtomicTransaction((current, options) => commitLogAppend(current, entry, options), {
+      successMessage: mode === "one" ? "Adjustment stamped. Enter the next shot." : "Adjustment stamped to the dope log.",
+    });
+    if (mode === "one" && shots.length) setGhosts((g) => appendBounded(g, shots[0], MAX_GHOSTS));
     setShots([]);
     setNumV({ dir: "LOW", val: "" });
     setNumH({ dir: "LEFT", val: "" });
+    focusEntryControl();
   };
 
   /* ----- profile editing ----- */
-  const updateProfile = (patch) => {
-    if (patch.clickMOA !== undefined) patch = { ...patch, clickMOA: Math.max(0.05, patch.clickMOA) };
-    if (patch.travelMOA !== undefined) patch = { ...patch, travelMOA: Math.max(10, patch.travelMOA) };
-    if (patch.elev !== undefined) patch = { ...patch, elev: { ...patch.elev, moaPerUnit: Math.max(0.5, patch.elev.moaPerUnit) } };
-    if (patch.wind !== undefined) patch = { ...patch, wind: { ...patch.wind, moaPerUnit: Math.max(0.5, patch.wind.moaPerUnit) } };
-
-    const target = profiles.find((p) => p.id === activeId);
+  const updateProfile = (profileId, patch) => {
+    const target = profiles.find((p) => p.id === profileId);
     if (!target) return;
 
+    if (patch.name !== undefined) {
+      const safeName = String(patch.name).trim()
+        || String(target.name ?? "").trim()
+        || String(target.short ?? "").trim()
+        || "Custom optic";
+      patch = { ...patch, name: safeName, short: safeName.slice(0, 12) };
+    }
+    if (patch.clickMOA !== undefined) {
+      patch = { ...patch, clickMOA: Math.min(100, Math.max(0.05, patch.clickMOA)) };
+    }
+    if (patch.travelMOA !== undefined) {
+      patch = { ...patch, travelMOA: Math.min(10_000, Math.max(10, patch.travelMOA)) };
+    }
+    if (patch.elev !== undefined) {
+      patch = {
+        ...patch,
+        elev: { ...patch.elev, moaPerUnit: Math.min(10_000, Math.max(0.5, patch.elev.moaPerUnit)) },
+      };
+    }
+    if (patch.wind !== undefined) {
+      patch = {
+        ...patch,
+        wind: { ...patch.wind, moaPerUnit: Math.min(10_000, Math.max(0.5, patch.wind.moaPerUnit)) },
+      };
+    }
+
+    const changed = Object.entries(patch).some(([field, value]) => (
+      JSON.stringify(target[field]) !== JSON.stringify(value)
+    ));
+    if (!changed) return;
+
     if (target.builtin) {
+      if (profiles.length >= MAX_PROFILES) {
+        setStatusMessage(`You can save up to ${MAX_PROFILES} optics. Delete a custom optic before editing a built-in preset.`);
+        return;
+      }
       const cloneId = "custom-" + crypto.randomUUID();
       const cloned = { ...target, ...patch, id: cloneId, builtin: false };
-      setProfiles((ps) => {
-        const idx = ps.findIndex((p) => p.id === target.id);
-        const next = [...ps];
-        next.splice(idx + 1, 0, cloned);
-        return next;
-      });
-      setActiveId(cloneId);
+      if (activeId === profileId) setCounterTurret("ELEVATION");
+      runAtomicTransaction(
+        (current, options) => commitProfileClone(
+          current,
+          profileId,
+          cloned,
+          {
+            ...options,
+            activate: current.data.activeId === profileId,
+          },
+        ),
+        {
+          successMessage: "A custom copy was created so the built-in preset remains unchanged.",
+        },
+        (committed) => {
+          if (committed.payload?.data.activeId === cloneId) clearTransientEntry();
+        },
+      );
       return;
     }
 
-    setProfiles((ps) => ps.map((p) => (p.id === activeId ? { ...p, ...patch } : p)));
+    runAtomicTransaction(
+      (current, options) => {
+        const latestTarget = current.data.profiles.find((candidate) => candidate.id === profileId);
+        if (!latestTarget) throw new RangeError("The optic no longer exists.");
+        const rebasedPatch = { ...patch };
+        if (patch.elev && latestTarget.elev) {
+          rebasedPatch.elev = { ...latestTarget.elev, ...patch.elev };
+        }
+        if (patch.wind && latestTarget.wind) {
+          rebasedPatch.wind = { ...latestTarget.wind, ...patch.wind };
+        }
+        if (Object.prototype.hasOwnProperty.call(patch, "rot")) {
+          const rotation = { ...(latestTarget.rot ?? {}) };
+          for (const direction of ["UP", "DOWN", "LEFT", "RIGHT"]) {
+            if (target.rot?.[direction] === patch.rot?.[direction]) continue;
+            if (patch.rot?.[direction]) rotation[direction] = patch.rot[direction];
+            else delete rotation[direction];
+          }
+          rebasedPatch.rot = Object.keys(rotation).length ? rotation : null;
+        }
+        return commitProfileUpsert(
+          current,
+          { ...latestTarget, ...rebasedPatch },
+          options,
+        );
+      },
+    );
   };
 
   const addCustom = () => {
+    if (profiles.length >= MAX_PROFILES) {
+      setStatusMessage(`You can save up to ${MAX_PROFILES} optics. Delete a custom optic before adding another.`);
+      return;
+    }
     const id = "custom-" + crypto.randomUUID();
-    setProfiles((ps) => [...ps, { id, name: "Custom optic", short: "Custom", clickMOA: 0.5, travelMOA: 80, rot: null }]);
-    switchOptic(id);
-    setEditing(true);
+    setCounterTurret("ELEVATION");
+    setDeleteCandidateId(null);
+    runAtomicTransaction((current, options) => {
+      let ordinal = 1;
+      const names = new Set(current.data.profiles.map((candidate) => candidate.name));
+      while (names.has(`Custom optic ${ordinal}`)) ordinal += 1;
+      return commitProfileUpsert(current, {
+        id,
+        name: `Custom optic ${ordinal}`,
+        short: `Custom ${ordinal}`,
+        clickMOA: 0.5,
+        travelMOA: 80,
+        rot: null,
+      }, { ...options, activate: true });
+    }, {
+      successMessage: "Custom optic added. Edit its specifications below.",
+    }, (committed) => {
+      if (committed.payload?.data.activeId !== id) return;
+      clearTransientEntry();
+      setEditorSession((current) => current + 1);
+      setEditing(true);
+    });
   };
 
   const deleteProfile = () => {
-    if (profile.builtin) return;
-    setProfiles((ps) => ps.filter((p) => p.id !== activeId));
-    switchOptic(PRESET_PROFILES[0].id);
-    setEditing(false);
+    const candidate = profiles.find((item) => item.id === deleteCandidateId);
+    if (!candidate || candidate.builtin) {
+      setDeleteCandidateId(null);
+      return;
+    }
+    const deletedName = candidate.name;
+    setCounterTurret("ELEVATION");
+    runAtomicTransaction(
+      (current, options) => commitProfileDelete(current, candidate.id, {
+        ...options,
+        nextActiveId: PRESET_PROFILES[0].id,
+      }),
+      { successMessage: `${deletedName} deleted. ${PRESET_PROFILES[0].short} selected.` },
+      (committed) => {
+        if (committed.payload?.data.profiles.some((item) => item.id === candidate.id)) return;
+        clearTransientEntry();
+        setEditing(false);
+        setEditorSession((current) => current + 1);
+        setDeleteCandidateId(null);
+        requestAnimationFrame(() => {
+          opticSelectorRef.current?.querySelector(`[data-optic-id="${PRESET_PROFILES[0].id}"]`)?.focus();
+        });
+      },
+    );
+  };
+
+  const requestProfileDelete = () => {
+    setDeleteCandidateId(activeId);
+    setStatusMessage(`Confirm deletion of ${profile.name}.`);
+    requestAnimationFrame(() => deleteConfirmRef.current?.focus());
   };
 
   const resetPresets = () => {
-    setProfiles((ps) => {
-      const customs = ps.filter((p) => !p.builtin);
-      return [...PRESET_PROFILES, ...customs];
+    let restoredSpecs = false;
+    let activeCalculationChanged = false;
+    runAtomicTransaction((current, options) => {
+      const changedPreset = PRESET_PROFILES.some((preset) => {
+        const savedPreset = current.data.profiles.find((candidate) => candidate.id === preset.id);
+        return JSON.stringify(savedPreset) !== JSON.stringify(preset);
+      });
+      if (!changedPreset) return current;
+      restoredSpecs = true;
+      const previousActive = current.data.profiles.find((candidate) => candidate.id === current.data.activeId);
+      const resetActive = PRESET_PROFILES.find((preset) => preset.id === current.data.activeId);
+      activeCalculationChanged = Boolean(resetActive)
+        && calculationProfileSignature(previousActive) !== calculationProfileSignature(resetActive);
+      // A raw lock-to-lock detent count remains mechanically valid when only
+      // declared click/travel specifications are corrected.
+      return commitProfilesReset(current, PRESET_PROFILES, {
+        ...options,
+        resetCounters: false,
+      });
+    }, {}, (committed) => {
+      if (!restoredSpecs) {
+        setStatusMessage("Built-in optic specifications already match their defaults.");
+        return;
+      }
+      if (activeCalculationChanged) clearTransientEntry();
+      if (committed.saved) {
+        setStatusMessage("Built-in optic specifications restored. Saved turret counts were preserved.");
+      }
     });
   };
 
   /* ----- counter helpers ----- */
+  const storedCounter = getCounterSession(counterSessions, activeId, counterTurret);
+  const counter = {
+    turret: counterTurret,
+    count: storedCounter.count,
+    done: storedCounter.done,
+  };
+  const centerGuidance = getMechanicalCenterGuidance(counter.count);
   const lockToLock = profile.type === "irons" ? 0 : Math.round(profile.travelMOA / profile.clickMOA);
-  const bump = (n) => setCounter((c) => ({ ...c, count: Math.max(0, c.count + n), done: false }));
+  const commitCounterValue = (count, done, successMessage = "") => {
+    const profileId = activeId;
+    const turret = counterTurret;
+    const boundedCount = Math.min(MAX_COUNTER_CLICKS, Math.max(0, Math.trunc(count)));
+    runAtomicTransaction(
+      (current, options) => commitCounterSession(current, {
+        profileId,
+        turret,
+        count: boundedCount,
+        done,
+      }, options),
+      { successMessage },
+    );
+  };
+  const bump = (amount) => {
+    const profileId = activeId;
+    const turret = counterTurret;
+    runAtomicTransaction((current, options) => {
+      const latestCounter = getCounterSession(current.data.counters, profileId, turret);
+      const nextCount = Math.min(
+        MAX_COUNTER_CLICKS,
+        Math.max(0, latestCounter.count + amount),
+      );
+      return commitCounterSession(current, {
+        profileId,
+        turret,
+        count: nextCount,
+        done: false,
+      }, options);
+    });
+  };
+
+  const completeCounter = () => {
+    const profileId = activeId;
+    const turret = counterTurret;
+    runAtomicTransaction(
+      (current, options) => {
+        const latestCounter = getCounterSession(current.data.counters, profileId, turret);
+        return commitCounterSession(current, {
+          profileId,
+          turret,
+          count: latestCounter.count,
+          done: true,
+        }, options);
+      },
+      { successMessage: "Mechanical center instruction calculated." },
+    );
+  };
+
+  const handleTabKeyDown = (event, currentId) => {
+    const currentIndex = TAB_IDS.indexOf(currentId);
+    let nextIndex = null;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") nextIndex = (currentIndex + 1) % TAB_IDS.length;
+    if (event.key === "ArrowLeft" || event.key === "ArrowUp") nextIndex = (currentIndex - 1 + TAB_IDS.length) % TAB_IDS.length;
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = TAB_IDS.length - 1;
+    if (nextIndex === null) return;
+    event.preventDefault();
+    const nextId = TAB_IDS[nextIndex];
+    setTab(nextId);
+    tabRefs.current[nextId]?.focus();
+  };
+
+  const clearShotMarks = () => {
+    setShots([]);
+    setGhosts([]);
+    setStatusMessage("Shot marks cleared.");
+    requestAnimationFrame(() => targetRef.current?.focus());
+  };
+
+  const undoShotMark = () => {
+    const nextShots = shots.slice(0, -1);
+    setShots(nextShots);
+    setStatusMessage("Last shot mark removed.");
+    if (nextShots.length === 0) requestAnimationFrame(() => targetRef.current?.focus());
+  };
+
+  const clearLog = () => {
+    runPatchTransaction({ log: [] }, { successMessage: "Dope log cleared." });
+    setClearLogPending(false);
+    requestAnimationFrame(() => logHeadingRef.current?.focus());
+  };
+
+  const resultAnnouncement = useMemo(() => {
+    if (numVError || numHError) return "";
+    if (!calc) return "";
+    if (zeroed) return "Result: within one adjustment of the point of aim.";
+    const lead = profile.type === "irons" ? "Sight adjustment result" : "Dialing result";
+    return `${lead}. Elevation: ${describeAdjustmentForSpeech(calc.elev, profile.type)}. Windage: ${describeAdjustmentForSpeech(calc.wind, profile.type)}.`;
+  }, [calc, zeroed, numVError, numHError, profile.type]);
 
   /* ============================ render ============================ */
+  if (!loaded) {
+    return (
+      <main className="app-loading" aria-busy="true" aria-live="polite">
+        <div style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 28 }}>CLICKBAIT</div>
+        <div style={{ fontFamily: FONT_MONO, marginTop: 8 }}>Loading saved range data…</div>
+      </main>
+    );
+  }
+
   return (
     <div style={{ minHeight: "100vh", background: C.paper, color: C.ink }}>
+      <a className="skip-link" href="#main-content">Skip to range controls</a>
       <style>{`
         * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-        button:focus-visible, input:focus-visible { outline: 3px solid ${C.orange}; outline-offset: 2px; }
+        button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, svg[role="button"]:focus-visible { outline: 3px solid ${C.ink}; outline-offset: 3px; }
         input { font-family: ${FONT_MONO}; }
         @keyframes stampIn { from { transform: scale(1.04); opacity: .4; } to { transform: scale(1); opacity: 1; } }
         .stamp { animation: stampIn .18s ease-out; }
         @media (prefers-reduced-motion: reduce) { .stamp { animation: none; } }
       `}</style>
 
-      <div style={{ maxWidth: 480, margin: "0 auto", padding: "16px 14px 40px" }}>
+      <main
+        id="main-content"
+        tabIndex={-1}
+        style={{
+          maxWidth: 480,
+          margin: "0 auto",
+          paddingTop: "calc(16px + env(safe-area-inset-top, 0px))",
+          paddingRight: "calc(14px + env(safe-area-inset-right, 0px))",
+          paddingBottom: "calc(40px + env(safe-area-inset-bottom, 0px))",
+          paddingLeft: "calc(14px + env(safe-area-inset-left, 0px))",
+        }}
+      >
         {/* header */}
         <header style={{ marginBottom: 12 }}>
           <div style={{ fontFamily: FONT_MONO, fontSize: 11, letterSpacing: "0.2em", color: C.inkSoft }}>
@@ -667,7 +1378,7 @@ function AppInner() {
               <circle cx="15" cy="15" r="12" fill="none" stroke={C.red} strokeWidth="2.5" />
               <circle cx="15" cy="15" r="4" fill={C.red} />
             </svg>
-            <h1 style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 42, lineHeight: 1, margin: 0, letterSpacing: "0.02em" }}>
+            <h1 className="app-title" style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 42, lineHeight: 1, margin: 0, letterSpacing: "0.02em" }}>
               CLICKBAIT
             </h1>
           </div>
@@ -676,491 +1387,167 @@ function AppInner() {
           </div>
         </header>
 
-        {/* optic selector */}
-        <Label>Optic</Label>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          {profiles.map((p) => (
-            <Chip key={p.id} active={p.id === activeId} onClick={() => { switchOptic(p.id); setEditing(false); }}>
-              {p.short}
-            </Chip>
-          ))}
-          <Chip onClick={addCustom}>+ add</Chip>
+        <div id="app-status" className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+          {persistenceWarning ? "" : statusMessage}
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8, flexWrap: "wrap" }}>
-          <span style={{ fontFamily: FONT_MONO, fontSize: 12.5, color: C.inkSoft }}>
-            {profile.name} ·{" "}
-            <b style={{ color: C.ink }}>
-              {profile.type === "irons"
-                ? `${profile.elev.moaPerUnit} MOA/turn · ${profile.wind.moaPerUnit} MOA/mm`
-                : `${profile.clickMOA} MOA/click`}
-            </b>
-          </span>
-          <button
-            onClick={() => setEditing((e) => !e)}
-            style={{ fontFamily: FONT_MONO, fontSize: 12, border: "none", background: "none", color: C.red, textDecoration: "underline", cursor: "pointer", padding: 4 }}
+        <div id="dial-result-status" className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+          {resultAnnouncement}
+        </div>
+
+        {persistenceWarning && (
+          <div
+            role="alert"
+            aria-live="assertive"
+            aria-atomic="true"
+            aria-label="Saving unavailable"
+            style={{
+              margin: "10px 0 14px",
+              padding: "10px 12px",
+              border: `2px solid ${C.red}`,
+              borderRadius: 4,
+              background: C.card,
+              color: C.red,
+              fontFamily: FONT_MONO,
+              fontSize: 12.5,
+              fontWeight: 600,
+              lineHeight: 1.5,
+            }}
           >
-            {editing ? "close" : "edit specs"}
-          </button>
-        </div>
-
-        {editing && (
-          <Card style={{ marginTop: 8 }}>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-              <label style={{ gridColumn: "1 / -1", fontFamily: FONT_MONO, fontSize: 12 }}>
-                Name
-                <input
-                  value={profile.name}
-                  onChange={(e) => updateProfile({ name: e.target.value, short: e.target.value.slice(0, 12) })}
-                  style={{ width: "100%", marginTop: 4, padding: 10, border: `2px solid ${C.ink}`, borderRadius: 3, fontSize: 14, background: C.paper }}
-                />
-              </label>
-              {profile.type === "irons" ? (
-                <>
-                  <label style={{ fontFamily: FONT_MONO, fontSize: 12 }}>
-                    MOA per turn (front post)
-                    <input
-                      type="number" step="0.1" min="0.5" inputMode="decimal"
-                      value={profile.elev.moaPerUnit}
-                      onChange={(e) => updateProfile({ elev: { ...profile.elev, moaPerUnit: parseFloat(e.target.value) || 6.9 } })}
-                      style={{ width: "100%", marginTop: 4, padding: 10, border: `2px solid ${C.ink}`, borderRadius: 3, fontSize: 14, background: C.paper }}
-                    />
-                  </label>
-                  <label style={{ fontFamily: FONT_MONO, fontSize: 12 }}>
-                    MOA per mm of drift
-                    <input
-                      type="number" step="0.1" min="0.5" inputMode="decimal"
-                      value={profile.wind.moaPerUnit}
-                      onChange={(e) => updateProfile({ wind: { ...profile.wind, moaPerUnit: parseFloat(e.target.value) || 9.1 } })}
-                      style={{ width: "100%", marginTop: 4, padding: 10, border: `2px solid ${C.ink}`, borderRadius: 3, fontSize: 14, background: C.paper }}
-                    />
-                  </label>
-                  <div style={{ gridColumn: "1 / -1", fontFamily: FONT_MONO, fontSize: 11.5, color: C.inkSoft }}>
-                    MOA per turn depends on sight radius and thread pitch — ~6.9 for AKM-pattern (378 mm radius, M6×0.75). Shorter rifles (AKS-74U etc.) differ.
-                  </div>
-                </>
-              ) : (
-                <>
-                  <label style={{ fontFamily: FONT_MONO, fontSize: 12 }}>
-                    MOA per click
-                    <input
-                      type="number" step="0.05" min="0.05" inputMode="decimal"
-                      value={profile.clickMOA}
-                      onChange={(e) => updateProfile({ clickMOA: parseFloat(e.target.value) || 0.25 })}
-                      style={{ width: "100%", marginTop: 4, padding: 10, border: `2px solid ${C.ink}`, borderRadius: 3, fontSize: 14, background: C.paper }}
-                    />
-                  </label>
-                  <label style={{ fontFamily: FONT_MONO, fontSize: 12 }}>
-                    Total travel (MOA)
-                    <input
-                      type="number" step="5" min="10" inputMode="numeric"
-                      value={profile.travelMOA}
-                      onChange={(e) => updateProfile({ travelMOA: parseFloat(e.target.value) || 60 })}
-                      style={{ width: "100%", marginTop: 4, padding: 10, border: `2px solid ${C.ink}`, borderRadius: 3, fontSize: 14, background: C.paper }}
-                    />
-                  </label>
-                  {[
-                    { lbl: "Elevation screw", anchor: "UP", key: "elev" },
-                    { lbl: "Windage screw", anchor: "RIGHT", key: "wind" },
-                  ].map(({ lbl, anchor, key }) => {
-                    const sel = rotToSel(profile.rot, anchor);
-                    return (
-                      <div key={key} style={{ gridColumn: "1 / -1" }}>
-                        <div style={{ fontFamily: FONT_MONO, fontSize: 12, marginBottom: 4 }}>{lbl}</div>
-                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                          {[["cw", `${anchor} = CW`], ["ccw", `${anchor} = CCW`], ["marked", "marked on turret"]].map(([v, txt]) => (
-                            <Chip
-                              key={v}
-                              active={sel === v}
-                              onClick={() =>
-                                updateProfile({
-                                  rot: buildRot(
-                                    key === "elev" ? v : rotToSel(profile.rot, "UP"),
-                                    key === "wind" ? v : rotToSel(profile.rot, "RIGHT")
-                                  ),
-                                })
-                              }
-                            >
-                              <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
-                                {v !== "marked" && <RotGlyph ccw={v === "ccw"} size={15} />}
-                                {txt}
-                              </span>
-                            </Chip>
-                          ))}
-                        </div>
-                      </div>
-                    );
-                  })}
-                  <div style={{ gridColumn: "1 / -1", fontFamily: FONT_MONO, fontSize: 11.5, color: C.inkSoft }}>
-                    CW/CCW = which way the screw turns to move impact UP / RIGHT. Check your optic's manual.
-                  </div>
-                </>
-              )}
-            </div>
-            <div style={{ display: "flex", gap: 12, marginTop: 10 }}>
-              {!profile.builtin && (
-                <button onClick={deleteProfile} style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.red, background: "none", border: "none", textDecoration: "underline", cursor: "pointer", padding: 4 }}>
-                  delete optic
-                </button>
-              )}
-              <button onClick={resetPresets} style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.inkSoft, background: "none", border: "none", textDecoration: "underline", cursor: "pointer", padding: 4 }}>
-                restore preset specs
-              </button>
-            </div>
-          </Card>
+            <strong style={{ display: "block", fontFamily: FONT_HEAD, fontSize: 15, letterSpacing: "0.08em" }}>
+              SAVING IS UNAVAILABLE
+            </strong>
+            {persistenceWarning}
+          </div>
         )}
 
-        {/* tabs */}
-        <div style={{ display: "flex", gap: 6, marginTop: 18, borderBottom: `2px solid ${C.ink}` }}>
-          {[
-            ["zero", "ZERO TARGET"],
-            ["center", profile.type === "irons" ? "SIGHT SETUP" : "CENTER TURRETS"],
-            ["log", `DOPE LOG${log.length ? ` (${log.length})` : ""}`],
-          ].map(([id, label]) => (
-            <button
-              key={id}
-              onClick={() => setTab(id)}
-              style={{
-                fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 14, letterSpacing: "0.08em",
-                padding: "12px 10px", minHeight: 46, flex: 1,
-                border: `2px solid ${C.ink}`, borderBottom: "none",
-                borderRadius: "5px 5px 0 0",
-                background: tab === id ? C.ink : C.card,
-                color: tab === id ? C.paper : C.inkSoft,
-                cursor: "pointer",
-              }}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
+        <OpticPanel
+          profiles={profiles}
+          activeId={activeId}
+          profile={profile}
+          maxProfiles={MAX_PROFILES}
+          editorSession={editorSession}
+          editing={editing}
+          deletePending={deleteCandidateId === activeId}
+          opticSelectorRef={opticSelectorRef}
+          deleteRequestRef={deleteRequestRef}
+          deleteConfirmRef={deleteConfirmRef}
+          onSwitchOptic={(id) => {
+            switchOptic(id);
+            setEditing(false);
+            setEditorSession((current) => current + 1);
+          }}
+          onAddCustom={addCustom}
+          onToggleEditing={() => {
+            if (!editing) setEditorSession((current) => current + 1);
+            setEditing(!editing);
+            setDeleteCandidateId(null);
+          }}
+          onUpdateProfile={(patch) => updateProfile(profile.id, patch)}
+          onRequestDelete={requestProfileDelete}
+          onDelete={deleteProfile}
+          onCancelDelete={() => {
+            setDeleteCandidateId(null);
+            setStatusMessage("Optic deletion canceled.");
+            requestAnimationFrame(() => deleteRequestRef.current?.focus());
+          }}
+          onResetPresets={() => {
+            resetPresets();
+          }}
+        />
 
-        {/* ================= ZERO TAB ================= */}
+        <AppTabs
+          tab={tab}
+          profile={profile}
+          logCount={log.length}
+          tabRefs={tabRefs}
+          onSelect={(id, label) => {
+            setTab(id);
+            setStatusMessage(`${label.replace(/\s*\(\d+\)$/, "")} tab selected.`);
+          }}
+          onKeyDown={handleTabKeyDown}
+        />
+
         {tab === "zero" && (
-          <div>
-            <Label>Distance to target</Label>
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-              {U.distances.map((d) => (
-                <Chip key={d} active={distance === d} onClick={() => setDistance(d)}>
-                  {d} {U.dist}
-                </Chip>
-              ))}
-              <div style={{ display: "flex", gap: 0 }}>
-                <input
-                  type="number" min="1" inputMode="numeric" value={distance}
-                  onChange={(e) => { const max = units === "imp" ? 2000 : 1800; setDistance(Math.max(1, Math.min(max, parseFloat(e.target.value) || 1))); }}
-                  aria-label="Custom distance"
-                  style={{ width: 74, padding: 10, minHeight: 44, border: `2px solid ${C.ink}`, borderRadius: "3px 0 0 3px", fontSize: 14, background: C.card }}
-                />
-                {["imp", "met"].map((u, i) => (
-                  <button
-                    key={u}
-                    onClick={() => switchUnits(u)}
-                    style={{
-                      fontFamily: FONT_MONO, fontSize: 12, fontWeight: 600, padding: "10px 10px", minHeight: 44,
-                      border: `2px solid ${C.ink}`, borderRadius: i === 1 ? "0 3px 3px 0" : "0",
-                      borderLeft: "none",
-                      background: units === u ? C.ink : C.card, color: units === u ? C.paper : C.ink, cursor: "pointer",
-                    }}
-                  >
-                    {u === "imp" ? "yd/in" : "m/cm"}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 6, marginTop: 20 }}>
-              <Label>
-                {mode === "one"
-                  ? entryMode === "tap" ? "Tap where your shot hit" : "Type your shot offset"
-                  : entryMode === "tap" ? "Tap where your shots hit" : "Type your group offset"}
-              </Label>
-              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                <Chip active={mode === "one"} onClick={() => switchMode("one")} title="Dial after every single shot">one shot</Chip>
-                <Chip active={mode === "group"} onClick={() => switchMode("group")} title="Fire a group, dial off its center">group</Chip>
-                <span style={{ width: 6 }} />
-                <Chip active={entryMode === "tap"} onClick={() => setEntryMode("tap")}>tap</Chip>
-                <Chip active={entryMode === "type"} onClick={() => setEntryMode("type")}>type</Chip>
-              </div>
-            </div>
-
-            {entryMode === "tap" ? (
-              <>
-                <Target
-                  span={span}
-                  gridStep={U.gridStep[span] || 1}
-                  lin={U.lin}
-                  shots={shots}
-                  ghosts={mode === "one" ? ghosts : []}
-                  center={calc ? { x: calc.cx, y: calc.cy } : null}
-                  predicted={calc && !zeroed ? calc.predicted : null}
-                  onTap={handleTargetTap}
-                />
-                <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center", flexWrap: "wrap" }}>
-                  <Chip onClick={() => setShots((s) => s.slice(0, -1))}>undo</Chip>
-                  <Chip onClick={() => { setShots([]); setGhosts([]); }}>clear</Chip>
-                  <span style={{ fontFamily: FONT_MONO, fontSize: 12.5, color: C.inkSoft }}>
-                    {mode === "one" ? (
-                      <>shot #{ghosts.length + 1}{ghosts.length > 0 && ` · ${ghosts.length} dialed`}</>
-                    ) : (
-                      <>
-                        {shots.length} shot{shots.length === 1 ? "" : "s"}
-                        {calc && calc.groupSize != null && ` · group ${fmt(calc.groupSize, 1)} ${U.lin}`}
-                      </>
-                    )}
-                  </span>
-                  <div style={{ display: "flex", gap: 6, marginLeft: "auto" }}>
-                    {U.spans.map((s) => (
-                      <Chip key={s} active={span === s} onClick={() => setSpan(s)} title="Target view width">
-                        {s}{U.lin}
-                      </Chip>
-                    ))}
-                  </div>
-                </div>
-              </>
-            ) : (
-              <Card style={{ marginTop: 12 }}>
-                {[
-                  { st: numV, set: setNumV, opts: ["LOW", "HIGH"], lbl: "Vertical" },
-                  { st: numH, set: setNumH, opts: ["LEFT", "RIGHT"], lbl: "Horizontal" },
-                ].map(({ st, set, opts, lbl }) => (
-                  <div key={lbl} style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10, flexWrap: "wrap" }}>
-                    <span style={{ fontFamily: FONT_MONO, fontSize: 12.5, width: 84, color: C.inkSoft }}>{lbl}:</span>
-                    {opts.map((o) => (
-                      <Chip key={o} active={st.dir === o} onClick={() => set({ ...st, dir: o })}>{o.toLowerCase()}</Chip>
-                    ))}
-                    <input
-                      type="number" step="0.1" min="0" inputMode="decimal" placeholder="0.0" value={st.val}
-                      onChange={(e) => set({ ...st, val: e.target.value })}
-                      style={{ width: 84, padding: 10, minHeight: 44, border: `2px solid ${C.ink}`, borderRadius: 3, fontSize: 15, background: C.paper }}
-                    />
-                    <span style={{ fontFamily: FONT_MONO, fontSize: 13 }}>{U.lin}</span>
-                  </div>
-                ))}
-                <div style={{ fontFamily: FONT_MONO, fontSize: 11.5, color: C.inkSoft }}>
-                  {mode === "one"
-                    ? "Measure from your shot to your point of aim."
-                    : "Measure from the center of your group to your point of aim."}
-                </div>
-              </Card>
-            )}
-
-            {/* results ticket */}
-            <Label>Dial it</Label>
-            {!calc ? (
-              <Card>
-                <div style={{ fontFamily: FONT_MONO, fontSize: 13.5, color: C.inkSoft }}>
-                  {mode === "one"
-                    ? "Fire one shot, then mark it above. Dial, stamp, repeat — walk it in."
-                    : "Fire a group of 3–5, then mark it above. Instructions appear here."}
-                </div>
-              </Card>
-            ) : zeroed ? (
-              <Card key="z" style={{ borderColor: C.ink }}>
-                <div className="stamp" style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 30, color: C.ink }}>
-                  ZEROED <span style={{ color: C.splat, textShadow: `0 0 1px ${C.ink}` }}>◉</span>
-                </div>
-                <div style={{ fontFamily: FONT_MONO, fontSize: 12.5, color: C.inkSoft }}>
-                  {mode === "one"
-                    ? "Shot is within one adjustment of point of aim. Confirm with a group before you call it zeroed."
-                    : "Group center is within one adjustment of point of aim. Send another group to confirm."}
-                </div>
-              </Card>
-            ) : (
-              <Card key={`${calc.elev.steps}${calc.elev.dir}-${calc.wind.steps}${calc.wind.dir}`}>
-                <div className="stamp">
-                  <AdjustRow axis="ELEVATION" result={calc.elev} type={profile.type} rot={profile.rot} lin={U.lin} />
-                  <AdjustRow axis="WINDAGE" result={calc.wind} type={profile.type} rot={profile.rot} lin={U.lin} />
-                  {profile.type === "irons" && (
-                    <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.inkSoft, marginTop: 10 }}>
-                      Adjust the FRONT sight only — set the rear leaf to its zeroing notch ("1" = 100 m) and leave it there.
-                    </div>
-                  )}
-                  <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.inkSoft, marginTop: profile.type === "irons" ? 6 : 10 }}>
-                    {profile.type === "irons"
-                      ? `${fmtUnits(calc.elev.spec.step, calc.elev.spec)} = ${fmt(calc.elev.spec.step * calc.elev.perUnit, 2)} ${U.lin} · ${fmtUnits(calc.wind.spec.step, calc.wind.spec)} = ${fmt(calc.wind.spec.step * calc.wind.perUnit, 2)} ${U.lin}`
-                      : `1 click = ${fmt(calc.elev.perUnit, 2)} ${U.lin}`}{" "}
-                    at {distance} {U.dist} · dashed white ring shows where the next group should land
-                  </div>
-                  {profile.type === "irons" ? (
-                    <>
-                      {calc.elev.overTravel && (
-                        <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.red, marginTop: 6, padding: "6px 10px", border: `1px solid ${C.red}`, borderRadius: 3 }}>
-                          ⚠ ELEVATION exceeds usable front-post travel (~{calc.elev.spec.maxUnits} turns) — check mounting and canting before cranking further.
-                        </div>
-                      )}
-                      {calc.wind.overTravel && (
-                        <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.red, marginTop: 6, padding: "6px 10px", border: `1px solid ${C.red}`, borderRadius: 3 }}>
-                          ⚠ WINDAGE exceeds usable dovetail travel (~{calc.wind.spec.maxUnits} mm).
-                        </div>
-                      )}
-                    </>
-                  ) : (
-                    (calc.elev.overTravel || calc.wind.overTravel) && (
-                      <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.red, marginTop: 6, padding: "6px 10px", border: `1px solid ${C.red}`, borderRadius: 3 }}>
-                        ⚠ Adjustment exceeds half-travel ({Math.round(calc.elev.spec.maxUnits)} clicks) — turret may not have enough range.
-                      </div>
-                    )
-                  )}
-                </div>
-              </Card>
-            )}
-            {calc && (
-              <button
-                onClick={stampLog}
-                style={{
-                  marginTop: 10, width: "100%", minHeight: 52, fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 17,
-                  letterSpacing: "0.1em", border: `2px solid ${C.ink}`, borderRadius: 4, background: C.splat, color: C.ink,
-                  cursor: "pointer", boxShadow: `3px 3px 0 ${C.grid}`,
-                }}
-              >
-                {mode === "one" ? "I DIALED IT — NEXT SHOT" : "I DIALED IT — STAMP TO LOG"}
-              </button>
-            )}
-            {mode === "one" && (
-              <div style={{ fontFamily: FONT_MONO, fontSize: 11.5, color: C.inkSoft, marginTop: 8 }}>
-                One shot is one data point — wind, trigger, and ammo all lie. Confirm with a group when you're close.
-              </div>
-            )}
-          </div>
+          <ZeroPanel
+            key={zeroSession}
+            unitSpec={U}
+            units={units}
+            distance={distance}
+            span={span}
+            mode={mode}
+            entryMode={entryMode}
+            shots={shots}
+            ghosts={ghosts}
+            markedCenter={markedCenter}
+            markedGroupSize={markedGroupSize}
+            calc={calc}
+            zeroed={zeroed}
+            profile={profile}
+            verticalOffset={numV}
+            horizontalOffset={numH}
+            verticalError={numVError}
+            horizontalError={numHError}
+            targetRef={targetRef}
+            manualVerticalRef={manualVerticalRef}
+            onDistanceChange={(nextDistance) => queuePersistedEdit({ distance: nextDistance })}
+            onUnitsChange={switchUnits}
+            onModeChange={switchMode}
+            onEntryModeChange={switchEntryMode}
+            onTargetTap={handleTargetTap}
+            onUndoShot={undoShotMark}
+            onClearShots={clearShotMarks}
+            onSpanChange={(nextSpan) => queuePersistedEdit({ span: nextSpan })}
+            onVerticalOffsetChange={setNumV}
+            onHorizontalOffsetChange={setNumH}
+            onStamp={stampLog}
+          />
         )}
 
-        {/* ================= CENTER TAB ================= */}
-        {tab === "center" && profile.type === "irons" && (
-          <div>
-            <Label>Sight setup</Label>
-            <Card>
-              <div style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 22 }}>No turrets to center.</div>
-              <div style={{ fontFamily: FONT_MONO, fontSize: 13.5, lineHeight: 1.7, marginTop: 8 }}>
-                Iron sights have no detents or mechanical center. To start from a known baseline:
-                <ol style={{ margin: "8px 0 0", paddingLeft: 20 }}>
-                  <li>Center the windage drum in its dovetail — line up the factory witness mark.</li>
-                  <li>Screw the front post to roughly mid-thread.</li>
-                  <li>Set the rear leaf to "1" (100 m) for zeroing.</li>
-                </ol>
-              </div>
-              <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.inkSoft, marginTop: 8 }}>
-                Then zero on the ZERO TARGET tab.
-              </div>
-            </Card>
-          </div>
-        )}
-        {tab === "center" && profile.type !== "irons" && (
-          <div>
-            <Label>Turret</Label>
-            <div style={{ display: "flex", gap: 8 }}>
-              {["ELEVATION", "WINDAGE"].map((t) => (
-                <Chip key={t} active={counter.turret === t} onClick={() => setCounter({ turret: t, count: 0, done: false })}>
-                  {t.toLowerCase()}
-                </Chip>
-              ))}
-            </div>
-
-            <Label>Procedure</Label>
-            <Card>
-              <ol style={{ margin: 0, paddingLeft: 20, fontFamily: FONT_MONO, fontSize: 13.5, lineHeight: 1.7 }}>
-                <li><b>Gently</b> turn the {counter.turret.toLowerCase()} screw clockwise until it stops.</li>
-                <li>Turn back counter-clockwise, tapping <b>+1</b> for every click, until it stops again.</li>
-                <li>Tap <b>done</b> — I'll tell you how far to come back.</li>
-              </ol>
-              <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.inkSoft, marginTop: 8 }}>
-                Expect roughly {lockToLock} clicks lock-to-lock on the {profile.short} ({profile.travelMOA} MOA ÷ {profile.clickMOA}).
-              </div>
-            </Card>
-
-            <div style={{ textAlign: "center", margin: "18px 0 10px" }}>
-              <div style={{ fontFamily: FONT_MONO, fontSize: 12, letterSpacing: "0.15em", color: C.inkSoft }}>CLICKS COUNTED</div>
-              <div className="stamp" key={counter.count} style={{ fontFamily: FONT_MONO, fontWeight: 600, fontSize: 72, lineHeight: 1.1 }}>
-                {counter.count}
-              </div>
-            </div>
-
-            <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr", gap: 8 }}>
-              <button onClick={() => bump(1)} style={{ minHeight: 88, fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 34, border: `2px solid ${C.ink}`, borderRadius: 4, background: C.ink, color: C.paper, cursor: "pointer", boxShadow: `3px 3px 0 ${C.grid}` }}>
-                +1
-              </button>
-              <button onClick={() => bump(10)} style={{ minHeight: 88, fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 22, border: `2px solid ${C.ink}`, borderRadius: 4, background: C.card, color: C.ink, cursor: "pointer" }}>
-                +10
-              </button>
-              <button onClick={() => bump(-1)} style={{ minHeight: 88, fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 22, border: `2px solid ${C.ink}`, borderRadius: 4, background: C.card, color: C.ink, cursor: "pointer" }}>
-                −1
-              </button>
-            </div>
-
-            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-              <button onClick={() => setCounter((c) => ({ ...c, count: 0, done: false }))} style={{ flex: 1, minHeight: 48, fontFamily: FONT_MONO, fontSize: 14, border: `2px solid ${C.ink}`, borderRadius: 4, background: C.card, cursor: "pointer" }}>
-                reset
-              </button>
-              <button onClick={() => setCounter((c) => ({ ...c, done: true }))} disabled={counter.count === 0} style={{ flex: 2, minHeight: 48, fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 16, letterSpacing: "0.08em", border: `2px solid ${C.ink}`, borderRadius: 4, background: counter.count ? C.splat : C.grid, color: C.ink, cursor: counter.count ? "pointer" : "default" }}>
-                DONE — CENTER IT
-              </button>
-            </div>
-
-            {counter.done && counter.count > 0 && (
-              <Card style={{ marginTop: 12 }}>
-                <div className="stamp">
-                  <div style={{ fontFamily: FONT_HEAD, fontWeight: 700, fontSize: 22 }}>
-                    Turn{" "}
-                    <span style={{ color: C.red }}>
-                      <RotGlyph size={24} style={{ verticalAlign: "middle", marginRight: 2 }} />
-                      {Math.round(counter.count / 2)} clicks clockwise
-                    </span>
-                  </div>
-                  <div style={{ fontFamily: FONT_MONO, fontSize: 13, color: C.inkSoft, marginTop: 4 }}>
-                    That puts the {counter.turret.toLowerCase()} turret at its mechanical center ({counter.count} total ÷ 2). Repeat for the other turret, then mount and zero.
-                  </div>
-                </div>
-              </Card>
-            )}
-
-            <div style={{ marginTop: 14, padding: "10px 12px", border: `2px solid ${C.red}`, borderRadius: 4, transform: "rotate(-0.6deg)", fontFamily: FONT_MONO, fontSize: 12.5, color: C.red, fontWeight: 600 }}>
-              ⚠ Never force a turret past its stop — when it binds, that's the end of travel.
-            </div>
-          </div>
+        {tab === "center" && (
+          <CenterPanel
+            key={centerSession}
+            profile={profile}
+            counter={counter}
+            centerGuidance={centerGuidance}
+            lockToLock={lockToLock}
+            maxCounterClicks={MAX_COUNTER_CLICKS}
+            onSelectTurret={(turret) => {
+              setCounterTurret(turret);
+              const restored = getCounterSession(counterSessions, activeId, turret);
+              setStatusMessage(`${turret.toLowerCase()} count restored at ${restored.count} clicks.`);
+            }}
+            onBump={bump}
+            onReset={() => commitCounterValue(0, false, "Turret click count reset.")}
+            onDone={completeCounter}
+          />
         )}
 
-        {/* ================= LOG TAB ================= */}
         {tab === "log" && (
-          <div>
-            <Label>Adjustment history</Label>
-            {log.length === 0 ? (
-              <Card>
-                <div style={{ fontFamily: FONT_MONO, fontSize: 13.5, color: C.inkSoft }}>
-                  Nothing stamped yet. After you dial an adjustment on the Zero tab, stamp it here so you know where every sight stands.
-                </div>
-              </Card>
-            ) : (
-              <>
-                {log.map((e, i) => (
-                  <Card key={e.id || `${e.ts}-${i}`} style={{ marginBottom: 8, padding: "10px 12px" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 6 }}>
-                      <span style={{ fontFamily: FONT_MONO, fontWeight: 600, fontSize: 14 }}>{e.optic} · {e.dist}</span>
-                      <span style={{ fontFamily: FONT_MONO, fontSize: 11.5, color: C.inkSoft }}>
-                        {new Date(e.ts).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
-                      </span>
-                    </div>
-                    <div style={{ fontFamily: FONT_MONO, fontSize: 13.5, marginTop: 4 }}>
-                      ELEV <b style={{ color: C.red }}>{e.e}</b> · WIND <b style={{ color: C.red }}>{e.w}</b>
-                      {e.grp && <span style={{ color: C.inkSoft }}> · group {e.grp}</span>}
-                      {e.one && <span style={{ color: C.inkSoft }}> · one-shot</span>}
-                    </div>
-                  </Card>
-                ))}
-                <button
-                  onClick={() => setLog([])}
-                  style={{ marginTop: 4, fontFamily: FONT_MONO, fontSize: 12.5, color: C.red, background: "none", border: "none", textDecoration: "underline", cursor: "pointer", padding: 6 }}
-                >
-                  clear log
-                </button>
-              </>
-            )}
-          </div>
+          <LogPanel
+            log={log}
+            clearPending={clearLogPending}
+            headingRef={logHeadingRef}
+            clearRequestRef={clearLogRequestRef}
+            clearConfirmRef={clearLogConfirmRef}
+            onRequestClear={() => {
+              setClearLogPending(true);
+              setStatusMessage(`Confirm clearing ${log.length} dope-log ${log.length === 1 ? "entry" : "entries"}.`);
+              requestAnimationFrame(() => clearLogConfirmRef.current?.focus());
+            }}
+            onClear={clearLog}
+            onCancelClear={() => {
+              setClearLogPending(false);
+              setStatusMessage("Clearing the dope log canceled.");
+              requestAnimationFrame(() => clearLogRequestRef.current?.focus());
+            }}
+          />
         )}
 
         {/* footer */}
         <footer style={{ marginTop: 26, fontFamily: FONT_MONO, fontSize: 11, lineHeight: 1.6, color: C.inkSoft, borderTop: `1px dashed ${C.grid}`, paddingTop: 10 }}>
           Click values preloaded from manufacturer manuals (HS507C-X2: 1 MOA · SLx 3×32 Gen III: ¼ MOA) — verify against your own manual; specs vary by model revision. AK irons: ~6.9 MOA per front-post turn / ~9.1 MOA per mm of drift (AKM-pattern sight radius — verify on your rifle). Follow all range safety rules. 1 MOA = 1.047 in at 100 yd / 2.908 cm at 100 m.
         </footer>
-      </div>
+      </main>
     </div>
   );
 }

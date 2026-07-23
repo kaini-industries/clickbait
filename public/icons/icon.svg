@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Clickbait target icon</title>
+  <desc id="desc">A lime splatter target and crosshair on black range paper</desc>
+  <!-- Opaque square base keeps iOS and maskable icons from rendering
+       transparent/black corner artifacts when the platform applies a mask. -->
+  <rect width="512" height="512" fill="#f4f4ec"/>
+  <rect width="512" height="512" rx="92" fill="#f4f4ec"/>
+  <rect x="38" y="38" width="436" height="436" rx="74" fill="#161914"/>
+  <g stroke="#4a5044" stroke-width="3" opacity=".55">
+    <path d="M96 38v436M176 38v436M256 38v436M336 38v436M416 38v436"/>
+    <path d="M38 96h436M38 176h436M38 256h436M38 336h436M38 416h436"/>
+  </g>
+  <path fill="#c8f51f" d="m256 99 22 90 67-64-28 89 91-19-76 55 83 40-92-5 41 82-70-60-14 92-25-90-64 67 25-91-90 23 74-58-85-36 92 1-44-80 73 57z"/>
+  <circle cx="256" cy="256" r="118" fill="#131311" stroke="#f4f4ec" stroke-width="12"/>
+  <circle cx="256" cy="256" r="68" fill="none" stroke="#c9d2c4" stroke-width="8"/>
+  <g fill="#f4f4ec">
+    <rect x="248" y="106" width="16" height="102" rx="8"/>
+    <rect x="248" y="304" width="16" height="102" rx="8"/>
+    <rect x="106" y="248" width="102" height="16" rx="8"/>
+    <rect x="304" y="248" width="102" height="16" rx="8"/>
+  </g>
+  <circle cx="256" cy="256" r="26" fill="#c3271b" stroke="#f4f4ec" stroke-width="8"/>
+</svg>
