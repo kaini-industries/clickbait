@@ -2,7 +2,8 @@
 
 Sight-in & turret assistant for MOA-based rifle and pistol optics. Tap your shots on an interactive splatter target, and Clickbait tells you exactly how many clicks to dial — and in which direction — to zero your optic.
 
-Built as a mobile-first PWA-style web app designed to be used at the range.
+Built as an installable, offline-capable mobile-first PWA designed to be used
+at the range.
 
 ## Features
 
@@ -25,6 +26,8 @@ Built as a mobile-first PWA-style web app designed to be used at the range.
 ### Adjustment Log
 - **Timestamped history** — every adjustment you stamp is logged with optic name, distance, elevation/windage clicks, and group size
 - **Persistent across sessions** — all data stored in localStorage
+- **Offline range use** — the current app shell is cached after the first
+  successful visit, with an explicit prompt when an update is ready
 
 ### Optic Profiles
 - **Built-in presets** — Holosun HS507C-X2 (1 MOA/click) and Primary Arms SLx 3x32 Gen III (0.25 MOA/click)
@@ -50,11 +53,16 @@ Direction follows the standard "chase the bullet hole" rule — if the shot is l
 
 - [Next.js](https://nextjs.org) 16 (App Router)
 - [React](https://react.dev) 19
-- No external UI libraries — all styles are inline
-- Google Fonts: Saira Condensed (headings) and IBM Plex Mono (data)
+- No external UI component library — feature styles are inline with a small
+  global accessibility/responsive stylesheet
+- Locally bundled Saira Condensed (headings) and IBM Plex Mono (data); builds
+  make no font-network requests
 - localStorage for persistence (no backend)
 
 ## Getting Started
+
+Use Node.js 24 (the repository includes `.nvmrc`). Next.js requires Node.js
+20.9 or newer.
 
 ```bash
 npm install
@@ -63,6 +71,32 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000) in your browser.
 
+## Quality Checks
+
+```bash
+npm run lint
+npm run typecheck
+npm run test:unit
+npm run audit:dependencies
+npm run check
+```
+
+`npm run typecheck` targets the extracted, safety-critical calculation and
+persistence modules plus their tests. JSX and framework files are covered by
+the Next.js compiler, ESLint, the production build, and browser tests.
+
+End-to-end tests run against a production server. Install the Playwright
+browser separately, then run the suite:
+
+```bash
+npx playwright install chromium
+npm run test:e2e
+```
+
+`npm run check:all` runs lint, the scoped typecheck, unit tests, a production
+build, and browser tests. CI also runs `npm run audit:dependencies` as a
+networked dependency-advisory gate.
+
 ## Build for Production
 
 ```bash
@@ -70,9 +104,25 @@ npm run build
 npm start
 ```
 
+Set `NEXT_PUBLIC_SITE_URL` to the public HTTPS origin at build time so Open
+Graph and Twitter image URLs are absolute on non-Vercel hosts:
+
+```bash
+NEXT_PUBLIC_SITE_URL=https://clickbait.example npm run build
+```
+
 ## Deploy
 
-Deploys to any platform that supports Next.js — Vercel, Netlify, Docker, or a static export via `next build`.
+Deploy to a platform that runs the Next.js server, such as Vercel, a compatible
+Netlify adapter, or a Node/Docker host. The app is statically prerendered, but
+`output: "export"` is intentionally not enabled: a pure static host cannot
+apply the security, service-worker, and cache-control headers configured in
+`next.config.mjs`.
+
+Production must be served over HTTPS for service-worker registration and PWA
+installation. The service worker uses network-first navigation, retains the
+last successful app shell for offline use, bounds its runtime cache, and waits
+for the user to accept an available update before reloading.
 
 ## License
 
